@@ -12,6 +12,9 @@ import {
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 const INTERVALS = ["1h", "4h", "1d", "1w"] as const;
+const DEFAULT_TICKER = "BTC-USD";
+const SETTINGS_KEY = "alphascanner:settings";
+const DRAWINGS_KEY = "alphascanner:drawings";
 const DEFAULT_SCAN_TICKERS = [
   "BTC-USD",
   "ETH-USD",
@@ -26,18 +29,62 @@ const DEFAULT_SCAN_TICKERS = [
   "QQQ",
   "NFLX",
 ];
+const FIB_LEVELS = [
+  { level: 0, label: "0" },
+  { level: 0.236, label: "0.236" },
+  { level: 0.382, label: "0.382" },
+  { level: 0.5, label: "0.5" },
+  { level: 0.618, label: "0.618" },
+  { level: 0.786, label: "0.786" },
+  { level: 1, label: "1" },
+];
 
 type Interval = (typeof INTERVALS)[number];
 type DrawMode = "none" | "trendline" | "horizontal" | "fibonacci";
-type IndicatorKey = "ema9" | "ema21" | "ema50" | "ema200" | "supertrend" | "rsi";
+type IndicatorKey =
+  | "ema9"
+  | "ema21"
+  | "ema50"
+  | "ema200"
+  | "supertrend"
+  | "rsi"
+  | "vwap"
+  | "bb_upper"
+  | "bb_middle"
+  | "bb_lower"
+  | "macd"
+  | "macd_signal";
 
-const INDICATOR_OPTIONS: { key: IndicatorKey; label: string; color: string }[] = [
-  { key: "ema9", label: "EMA 9", color: "#3EE7F7" },
-  { key: "ema21", label: "EMA 21", color: "#F6C453" },
-  { key: "ema50", label: "EMA 50", color: "#8BD3FF" },
-  { key: "ema200", label: "EMA 200", color: "#FF9B72" },
-  { key: "supertrend", label: "SuperTrend", color: "#2EEA8C" },
-  { key: "rsi", label: "RSI", color: "#9FB0C3" },
+type IndicatorGroup = {
+  label: string;
+  keys: IndicatorKey[];
+};
+
+const INDICATOR_COLORS: Record<IndicatorKey, string> = {
+  ema9: "#3EE7F7",
+  ema21: "#F6C453",
+  ema50: "#8BD3FF",
+  ema200: "#FF9B72",
+  supertrend: "#2EEA8C",
+  rsi: "#9FB0C3",
+  vwap: "#B6FF5C",
+  bb_upper: "#6A7A8C",
+  bb_middle: "#9FB0C3",
+  bb_lower: "#6A7A8C",
+  macd: "#F6C453",
+  macd_signal: "#FF9B72",
+};
+
+const INDICATOR_GROUPS: IndicatorGroup[] = [
+  { label: "EMA 9", keys: ["ema9"] },
+  { label: "EMA 21", keys: ["ema21"] },
+  { label: "EMA 50", keys: ["ema50"] },
+  { label: "EMA 200", keys: ["ema200"] },
+  { label: "SuperTrend", keys: ["supertrend"] },
+  { label: "VWAP", keys: ["vwap"] },
+  { label: "Bollinger Bands", keys: ["bb_upper", "bb_middle", "bb_lower"] },
+  { label: "RSI", keys: ["rsi"] },
+  { label: "MACD", keys: ["macd", "macd_signal"] },
 ];
 
 type Candle = {
@@ -64,9 +111,36 @@ type Indicator = {
   ema200: number;
   supertrend: number;
   rsi: number;
+  vwap: number;
+  bb_upper: number;
+  bb_middle: number;
+  bb_lower: number;
+  macd: number;
+  macd_signal: number;
 };
 
 type IndicatorVisibility = Record<IndicatorKey, boolean>;
+
+type DrawPoint = {
+  time: UTCTimestamp;
+  price: number;
+};
+
+type DrawingsState = {
+  trendlines: { start: DrawPoint; end: DrawPoint }[];
+  horizontals: { price: number }[];
+  fibs: { start: DrawPoint; end: DrawPoint }[];
+};
+
+type StoredSettings = {
+  mode: "chart" | "scanner";
+  ticker: string;
+  tickerInput: string;
+  interval: Interval;
+  indicatorVisibility: Partial<IndicatorVisibility>;
+  scanTickersInput: string;
+  drawMode?: DrawMode;
+};
 
 type AnalyzeResponse = {
   meta: {
@@ -115,12 +189,51 @@ const formatPrice = (value?: number | null) => {
   return value.toFixed(2);
 };
 
+const DEFAULT_INDICATOR_VISIBILITY: IndicatorVisibility = {
+  ema9: true,
+  ema21: true,
+  ema50: true,
+  ema200: true,
+  supertrend: true,
+  rsi: true,
+  vwap: true,
+  bb_upper: false,
+  bb_middle: false,
+  bb_lower: false,
+  macd: false,
+  macd_signal: false,
+};
+
+const loadStoredJson = <T,>(key: string, fallback: T): T => {
+  if (typeof window === "undefined") {
+    return fallback;
+  }
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) {
+      return fallback;
+    }
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+};
+
+const normalizeIndicatorVisibility = (
+  stored: Partial<IndicatorVisibility> | undefined
+): IndicatorVisibility => ({
+  ...DEFAULT_INDICATOR_VISIBILITY,
+  ...(stored ?? {}),
+});
+
 const timeToSeconds = (time: Time) => {
   if (typeof time === "number") {
     return time;
   }
   return Math.floor(Date.UTC(time.year, time.month - 1, time.day) / 1000);
 };
+
+const toTimestamp = (time: Time): UTCTimestamp => timeToSeconds(time) as UTCTimestamp;
 
 export default function App() {
   const chartContainerRef = useRef<HTMLDivElement | null>(null);
@@ -133,6 +246,12 @@ export default function App() {
     ema200: null,
     supertrend: null,
     rsi: null,
+    vwap: null,
+    bb_upper: null,
+    bb_middle: null,
+    bb_lower: null,
+    macd: null,
+    macd_signal: null,
   });
   const drawingsRef = useRef({
     trendlines: [] as ISeriesApi<"Line">[],
@@ -140,21 +259,48 @@ export default function App() {
     fibs: [] as ReturnType<ISeriesApi<"Candlestick">["createPriceLine"]>[],
   });
   const rsiLinesRef = useRef<ReturnType<ISeriesApi<"Line">["createPriceLine"]>[]>([]);
-  const drawPointsRef = useRef<{ time: Time; price: number }[]>([]);
-
-  const [mode, setMode] = useState<"chart" | "scanner">("chart");
-  const [tickerInput, setTickerInput] = useState("AAPL");
-  const [ticker, setTicker] = useState("AAPL");
-  const [interval, setInterval] = useState<Interval>("1d");
-  const [indicatorVisibility, setIndicatorVisibility] = useState<IndicatorVisibility>({
-    ema9: true,
-    ema21: true,
-    ema50: true,
-    ema200: true,
-    supertrend: true,
-    rsi: true,
+  const drawPointsRef = useRef<DrawPoint[]>([]);
+  const previewRef = useRef<{
+    horizontal: ReturnType<ISeriesApi<"Candlestick">["createPriceLine"]> | null;
+    trendline: ISeriesApi<"Line"> | null;
+    fibs: ReturnType<ISeriesApi<"Candlestick">["createPriceLine"]>[];
+  }>({
+    horizontal: null,
+    trendline: null,
+    fibs: [],
   });
-  const [drawMode, setDrawMode] = useState<DrawMode>("none");
+
+  const storedSettings = useMemo(
+    () => loadStoredJson<StoredSettings | null>(SETTINGS_KEY, null),
+    []
+  );
+  const storedDrawings = useMemo(
+    () =>
+      loadStoredJson<DrawingsState>(DRAWINGS_KEY, {
+        trendlines: [],
+        horizontals: [],
+        fibs: [],
+      }),
+    []
+  );
+
+  const [mode, setMode] = useState<"chart" | "scanner">(
+    storedSettings?.mode ?? "chart"
+  );
+  const [tickerInput, setTickerInput] = useState(
+    storedSettings?.tickerInput ?? DEFAULT_TICKER
+  );
+  const [ticker, setTicker] = useState(storedSettings?.ticker ?? DEFAULT_TICKER);
+  const [interval, setInterval] = useState<Interval>(
+    storedSettings?.interval ?? "1d"
+  );
+  const [indicatorVisibility, setIndicatorVisibility] = useState<IndicatorVisibility>(
+    normalizeIndicatorVisibility(storedSettings?.indicatorVisibility)
+  );
+  const [drawMode, setDrawMode] = useState<DrawMode>(
+    storedSettings?.drawMode ?? "none"
+  );
+  const [drawings, setDrawings] = useState<DrawingsState>(storedDrawings);
   const [meta, setMeta] = useState<AnalyzeResponse["meta"] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -165,7 +311,7 @@ export default function App() {
   const [scanError, setScanError] = useState<string | null>(null);
   const [scanRefresh, setScanRefresh] = useState(0);
   const [scanTickersInput, setScanTickersInput] = useState(
-    DEFAULT_SCAN_TICKERS.join(", ")
+    storedSettings?.scanTickersInput ?? DEFAULT_SCAN_TICKERS.join(", ")
   );
 
   const parsedScanTickers = useMemo(
@@ -176,6 +322,29 @@ export default function App() {
         .filter(Boolean),
     [scanTickersInput]
   );
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const settings: StoredSettings = {
+      mode,
+      ticker,
+      tickerInput,
+      interval,
+      indicatorVisibility,
+      scanTickersInput,
+      drawMode,
+    };
+    window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  }, [mode, ticker, tickerInput, interval, indicatorVisibility, scanTickersInput, drawMode]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.localStorage.setItem(DRAWINGS_KEY, JSON.stringify(drawings));
+  }, [drawings]);
 
   useEffect(() => {
     if (mode !== "chart" || !chartContainerRef.current) {
@@ -212,46 +381,92 @@ export default function App() {
 
     const indicatorSeries: Record<IndicatorKey, ISeriesApi<"Line">> = {
       ema9: chart.addLineSeries({
-        color: INDICATOR_OPTIONS.find((option) => option.key === "ema9")?.color ?? "#3EE7F7",
+        color: INDICATOR_COLORS.ema9,
         lineWidth: 2,
         priceLineVisible: false,
         lastValueVisible: false,
       }),
       ema21: chart.addLineSeries({
-        color: INDICATOR_OPTIONS.find((option) => option.key === "ema21")?.color ?? "#F6C453",
+        color: INDICATOR_COLORS.ema21,
         lineWidth: 2,
         priceLineVisible: false,
         lastValueVisible: false,
       }),
       ema50: chart.addLineSeries({
-        color: INDICATOR_OPTIONS.find((option) => option.key === "ema50")?.color ?? "#8BD3FF",
+        color: INDICATOR_COLORS.ema50,
         lineWidth: 2,
         priceLineVisible: false,
         lastValueVisible: false,
       }),
       ema200: chart.addLineSeries({
-        color: INDICATOR_OPTIONS.find((option) => option.key === "ema200")?.color ?? "#FF9B72",
+        color: INDICATOR_COLORS.ema200,
         lineWidth: 2,
         priceLineVisible: false,
         lastValueVisible: false,
       }),
       supertrend: chart.addLineSeries({
-        color: INDICATOR_OPTIONS.find((option) => option.key === "supertrend")?.color ?? "#2EEA8C",
+        color: INDICATOR_COLORS.supertrend,
         lineWidth: 2,
         priceLineVisible: false,
         lastValueVisible: false,
       }),
+      vwap: chart.addLineSeries({
+        color: INDICATOR_COLORS.vwap,
+        lineWidth: 2,
+        priceLineVisible: false,
+        lastValueVisible: false,
+      }),
+      bb_upper: chart.addLineSeries({
+        color: INDICATOR_COLORS.bb_upper,
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        priceLineVisible: false,
+        lastValueVisible: false,
+      }),
+      bb_middle: chart.addLineSeries({
+        color: INDICATOR_COLORS.bb_middle,
+        lineWidth: 1,
+        lineStyle: LineStyle.Dotted,
+        priceLineVisible: false,
+        lastValueVisible: false,
+      }),
+      bb_lower: chart.addLineSeries({
+        color: INDICATOR_COLORS.bb_lower,
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        priceLineVisible: false,
+        lastValueVisible: false,
+      }),
       rsi: chart.addLineSeries({
-        color: INDICATOR_OPTIONS.find((option) => option.key === "rsi")?.color ?? "#9FB0C3",
+        color: INDICATOR_COLORS.rsi,
         lineWidth: 2,
         priceLineVisible: false,
         lastValueVisible: false,
         priceScaleId: "rsi",
       }),
+      macd: chart.addLineSeries({
+        color: INDICATOR_COLORS.macd,
+        lineWidth: 2,
+        priceLineVisible: false,
+        lastValueVisible: false,
+        priceScaleId: "macd",
+      }),
+      macd_signal: chart.addLineSeries({
+        color: INDICATOR_COLORS.macd_signal,
+        lineWidth: 2,
+        lineStyle: LineStyle.Dashed,
+        priceLineVisible: false,
+        lastValueVisible: false,
+        priceScaleId: "macd",
+      }),
     };
 
     chart.priceScale("rsi").applyOptions({
       scaleMargins: { top: 0.75, bottom: 0.05 },
+      borderColor: "#1F2A3A",
+    });
+    chart.priceScale("macd").applyOptions({
+      scaleMargins: { top: 0.55, bottom: 0.25 },
       borderColor: "#1F2A3A",
     });
 
@@ -308,10 +523,17 @@ export default function App() {
         ema200: null,
         supertrend: null,
         rsi: null,
+        vwap: null,
+        bb_upper: null,
+        bb_middle: null,
+        bb_lower: null,
+        macd: null,
+        macd_signal: null,
       };
       rsiLinesRef.current = [];
       drawingsRef.current = { trendlines: [], horizontals: [], fibs: [] };
       drawPointsRef.current = [];
+      previewRef.current = { horizontal: null, trendline: null, fibs: [] };
     };
   }, [mode]);
 
@@ -325,6 +547,10 @@ export default function App() {
         series.applyOptions({ visible: indicatorVisibility[key] });
       }
     });
+    const rsiVisible = indicatorVisibility.rsi;
+    rsiLinesRef.current.forEach((line) =>
+      line.applyOptions({ lineVisible: rsiVisible, axisLabelVisible: rsiVisible })
+    );
   }, [indicatorVisibility, mode]);
 
   useEffect(() => {
@@ -343,7 +569,16 @@ export default function App() {
       try {
         const response = await fetch(`${API_BASE}/analyze/${ticker}/${interval}`);
         if (!response.ok) {
-          throw new Error(`API error: ${response.status}`);
+          let detail = "";
+          try {
+            const payload = await response.json();
+            if (payload && typeof payload.detail === "string") {
+              detail = payload.detail;
+            }
+          } catch {
+            detail = "";
+          }
+          throw new Error(detail || `API error: ${response.status}`);
         }
 
         const data = (await response.json()) as AnalyzeResponse;
@@ -366,6 +601,7 @@ export default function App() {
               color: signal.type === "buy" ? "#2EEA8C" : "#FF4D6D",
               shape: signal.type === "buy" ? "arrowUp" : "arrowDown",
               text: signal.type === "buy" ? "BUY" : "SELL",
+              size: 2,
             }))
             .sort((a, b) => timeToSeconds(a.time) - timeToSeconds(b.time))
         );
@@ -378,6 +614,12 @@ export default function App() {
           ema200: indicator.ema200,
           supertrend: indicator.supertrend,
           rsi: indicator.rsi,
+          vwap: indicator.vwap,
+          bb_upper: indicator.bb_upper,
+          bb_middle: indicator.bb_middle,
+          bb_lower: indicator.bb_lower,
+          macd: indicator.macd,
+          macd_signal: indicator.macd_signal,
         }));
 
         const buildLineData = (values: { time: Time; value: number }[]) =>
@@ -400,8 +642,26 @@ export default function App() {
         indicatorSeriesRef.current.supertrend?.setData(
           buildLineData(indicatorRows.map((row) => ({ time: row.time, value: row.supertrend })))
         );
+        indicatorSeriesRef.current.vwap?.setData(
+          buildLineData(indicatorRows.map((row) => ({ time: row.time, value: row.vwap })))
+        );
+        indicatorSeriesRef.current.bb_upper?.setData(
+          buildLineData(indicatorRows.map((row) => ({ time: row.time, value: row.bb_upper })))
+        );
+        indicatorSeriesRef.current.bb_middle?.setData(
+          buildLineData(indicatorRows.map((row) => ({ time: row.time, value: row.bb_middle })))
+        );
+        indicatorSeriesRef.current.bb_lower?.setData(
+          buildLineData(indicatorRows.map((row) => ({ time: row.time, value: row.bb_lower })))
+        );
         indicatorSeriesRef.current.rsi?.setData(
           buildLineData(indicatorRows.map((row) => ({ time: row.time, value: row.rsi })))
+        );
+        indicatorSeriesRef.current.macd?.setData(
+          buildLineData(indicatorRows.map((row) => ({ time: row.time, value: row.macd })))
+        );
+        indicatorSeriesRef.current.macd_signal?.setData(
+          buildLineData(indicatorRows.map((row) => ({ time: row.time, value: row.macd_signal })))
         );
 
         chartRef.current?.timeScale().fitContent();
@@ -437,7 +697,16 @@ export default function App() {
         );
 
         if (!response.ok) {
-          throw new Error(`API error: ${response.status}`);
+          let detail = "";
+          try {
+            const payload = await response.json();
+            if (payload && typeof payload.detail === "string") {
+              detail = payload.detail;
+            }
+          } catch {
+            detail = "";
+          }
+          throw new Error(detail || `API error: ${response.status}`);
         }
 
         const data = (await response.json()) as ScanResponse;
@@ -460,10 +729,183 @@ export default function App() {
   }, [mode, interval, scanRefresh]);
 
   useEffect(() => {
-    if (drawMode === "none") {
-      drawPointsRef.current = [];
+    drawPointsRef.current = [];
+    const series = seriesRef.current;
+    const chart = chartRef.current;
+    if (series && chart) {
+      if (previewRef.current.horizontal) {
+        series.removePriceLine(previewRef.current.horizontal);
+        previewRef.current.horizontal = null;
+      }
+      if (previewRef.current.trendline) {
+        chart.removeSeries(previewRef.current.trendline);
+        previewRef.current.trendline = null;
+      }
+      previewRef.current.fibs.forEach((line) => series.removePriceLine(line));
+      previewRef.current.fibs = [];
     }
   }, [drawMode]);
+
+  const renderDrawings = (state: DrawingsState) => {
+    const chart = chartRef.current;
+    const series = seriesRef.current;
+    if (!chart || !series) {
+      return;
+    }
+
+    drawingsRef.current.trendlines.forEach((line) => chart.removeSeries(line));
+    drawingsRef.current.horizontals.forEach((line) => series.removePriceLine(line));
+    drawingsRef.current.fibs.forEach((line) => series.removePriceLine(line));
+    drawingsRef.current = { trendlines: [], horizontals: [], fibs: [] };
+
+    state.trendlines.forEach((trend) => {
+      const lineSeries = chart.addLineSeries({
+        color: "#F6C453",
+        lineWidth: 2,
+        priceLineVisible: false,
+        lastValueVisible: false,
+      });
+      lineSeries.setData([
+        { time: trend.start.time, value: trend.start.price },
+        { time: trend.end.time, value: trend.end.price },
+      ]);
+      drawingsRef.current.trendlines.push(lineSeries);
+    });
+
+    state.horizontals.forEach((horizontal) => {
+      const line = series.createPriceLine({
+        price: horizontal.price,
+        color: "#3EE7F7",
+        lineWidth: 2,
+        lineStyle: LineStyle.Solid,
+        axisLabelVisible: true,
+        title: "H",
+      });
+      drawingsRef.current.horizontals.push(line);
+    });
+
+    state.fibs.forEach((fib) => {
+      const diff = fib.end.price - fib.start.price;
+      FIB_LEVELS.forEach((item) => {
+        const line = series.createPriceLine({
+          price: fib.start.price + diff * item.level,
+          color: item.level === 0 || item.level === 1 ? "#F6C453" : "#9FB0C3",
+          lineWidth: item.level === 0 || item.level === 1 ? 2 : 1,
+          lineStyle: item.level === 0 || item.level === 1 ? LineStyle.Solid : LineStyle.Dashed,
+          axisLabelVisible: true,
+          title: `Fib ${item.label}`,
+        });
+        drawingsRef.current.fibs.push(line);
+      });
+    });
+  };
+
+  useEffect(() => {
+    if (mode !== "chart") {
+      return;
+    }
+    renderDrawings(drawings);
+  }, [drawings, mode]);
+
+  useEffect(() => {
+    if (mode !== "chart") {
+      return;
+    }
+    const chart = chartRef.current;
+    const series = seriesRef.current;
+    if (!chart || !series) {
+      return;
+    }
+
+    const handleMove = (param: any) => {
+      if (drawMode === "none") {
+        return;
+      }
+      if (!param.point) {
+        return;
+      }
+
+      const time =
+        param.time ?? (chart.timeScale().coordinateToTime(param.point.x) as Time | null);
+      if (time === null || time === undefined) {
+        return;
+      }
+
+      const price = series.coordinateToPrice(param.point.y);
+      if (price === null) {
+        return;
+      }
+
+      if (drawMode === "horizontal") {
+        if (!previewRef.current.horizontal) {
+          previewRef.current.horizontal = series.createPriceLine({
+            price,
+            color: "#3EE7F7",
+            lineWidth: 1,
+            lineStyle: LineStyle.Dashed,
+            axisLabelVisible: true,
+            title: "H",
+          });
+        } else {
+          previewRef.current.horizontal.applyOptions({ price });
+        }
+      } else if (previewRef.current.horizontal) {
+        series.removePriceLine(previewRef.current.horizontal);
+        previewRef.current.horizontal = null;
+      }
+
+      if (drawMode === "trendline" && drawPointsRef.current.length === 1) {
+        const start = drawPointsRef.current[0];
+        const end: DrawPoint = { time: toTimestamp(time), price };
+        const ordered = start.time <= end.time ? [start, end] : [end, start];
+        if (!previewRef.current.trendline) {
+          previewRef.current.trendline = chart.addLineSeries({
+            color: "#F6C453",
+            lineWidth: 2,
+            lineStyle: LineStyle.Dashed,
+            priceLineVisible: false,
+            lastValueVisible: false,
+          });
+        }
+        previewRef.current.trendline.setData([
+          { time: ordered[0].time, value: ordered[0].price },
+          { time: ordered[1].time, value: ordered[1].price },
+        ]);
+      } else if (previewRef.current.trendline) {
+        chart.removeSeries(previewRef.current.trendline);
+        previewRef.current.trendline = null;
+      }
+
+      if (drawMode === "fibonacci" && drawPointsRef.current.length === 1) {
+        const start = drawPointsRef.current[0];
+        const end: DrawPoint = { time: toTimestamp(time), price };
+        const diff = end.price - start.price;
+        if (previewRef.current.fibs.length === 0) {
+          previewRef.current.fibs = FIB_LEVELS.map((item) =>
+            series.createPriceLine({
+              price: start.price + diff * item.level,
+              color: item.level === 0 || item.level === 1 ? "#F6C453" : "#9FB0C3",
+              lineWidth: item.level === 0 || item.level === 1 ? 2 : 1,
+              lineStyle: LineStyle.Dashed,
+              axisLabelVisible: true,
+              title: `Fib ${item.label}`,
+            })
+          );
+        } else {
+          previewRef.current.fibs.forEach((line, idx) => {
+            const item = FIB_LEVELS[idx];
+            line.applyOptions({ price: start.price + diff * item.level });
+          });
+        }
+      } else if (previewRef.current.fibs.length > 0) {
+        previewRef.current.fibs.forEach((line) => series.removePriceLine(line));
+        previewRef.current.fibs = [];
+      }
+    };
+
+    chart.subscribeCrosshairMove(handleMove);
+    return () => chart.unsubscribeCrosshairMove(handleMove);
+  }, [drawMode, mode]);
 
   useEffect(() => {
     if (mode !== "chart") {
@@ -495,66 +937,42 @@ export default function App() {
       }
 
       if (drawMode === "horizontal") {
-        const line = series.createPriceLine({
-          price,
-          color: "#3EE7F7",
-          lineWidth: 2,
-          lineStyle: LineStyle.Solid,
-          axisLabelVisible: true,
-          title: "H",
-        });
-        drawingsRef.current.horizontals.push(line);
+        setDrawings((prev) => ({
+          ...prev,
+          horizontals: [...prev.horizontals, { price }],
+        }));
         return;
       }
 
-      drawPointsRef.current = [...drawPointsRef.current, { time, price }];
+      const nextPoint: DrawPoint = { time: toTimestamp(time), price };
+      drawPointsRef.current = [...drawPointsRef.current, nextPoint];
       if (drawPointsRef.current.length < 2) {
         return;
       }
 
       const [pointA, pointB] = drawPointsRef.current.slice(-2);
       drawPointsRef.current = [];
-      const [start, end] =
-        timeToSeconds(pointA.time) <= timeToSeconds(pointB.time) ? [pointA, pointB] : [pointB, pointA];
+      const [start, end] = pointA.time <= pointB.time ? [pointA, pointB] : [pointB, pointA];
 
       if (drawMode === "trendline") {
-        const lineSeries = chart.addLineSeries({
-          color: "#F6C453",
-          lineWidth: 2,
-          priceLineVisible: false,
-          lastValueVisible: false,
-        });
-        lineSeries.setData([
-          { time: start.time, value: start.price },
-          { time: end.time, value: end.price },
-        ]);
-        drawingsRef.current.trendlines.push(lineSeries);
+        setDrawings((prev) => ({
+          ...prev,
+          trendlines: [...prev.trendlines, { start, end }],
+        }));
+        if (previewRef.current.trendline) {
+          chart.removeSeries(previewRef.current.trendline);
+          previewRef.current.trendline = null;
+        }
         return;
       }
 
       if (drawMode === "fibonacci") {
-        const diff = end.price - start.price;
-        const levels = [
-          { level: 0, label: "0" },
-          { level: 0.236, label: "0.236" },
-          { level: 0.382, label: "0.382" },
-          { level: 0.5, label: "0.5" },
-          { level: 0.618, label: "0.618" },
-          { level: 0.786, label: "0.786" },
-          { level: 1, label: "1" },
-        ];
-
-        levels.forEach((item) => {
-          const line = series.createPriceLine({
-            price: start.price + diff * item.level,
-            color: item.level === 0 || item.level === 1 ? "#F6C453" : "#9FB0C3",
-            lineWidth: item.level === 0 || item.level === 1 ? 2 : 1,
-            lineStyle: item.level === 0 || item.level === 1 ? LineStyle.Solid : LineStyle.Dashed,
-            axisLabelVisible: true,
-            title: `Fib ${item.label}`,
-          });
-          drawingsRef.current.fibs.push(line);
-        });
+        setDrawings((prev) => ({
+          ...prev,
+          fibs: [...prev.fibs, { start, end }],
+        }));
+        previewRef.current.fibs.forEach((line) => series.removePriceLine(line));
+        previewRef.current.fibs = [];
       }
     };
 
@@ -562,22 +980,26 @@ export default function App() {
     return () => chart.unsubscribeClick(handleClick);
   }, [drawMode, mode]);
 
-  const toggleIndicator = (key: IndicatorKey) => {
-    setIndicatorVisibility((prev) => ({ ...prev, [key]: !prev[key] }));
+  const toggleIndicatorGroup = (keys: IndicatorKey[]) => {
+    setIndicatorVisibility((prev) => {
+      const isActive = keys.every((key) => prev[key]);
+      const next = { ...prev };
+      keys.forEach((key) => {
+        next[key] = !isActive;
+      });
+      return next;
+    });
   };
 
   const clearDrawings = () => {
-    const chart = chartRef.current;
-    const series = seriesRef.current;
-    if (!chart || !series) {
-      return;
-    }
-
-    drawingsRef.current.trendlines.forEach((line) => chart.removeSeries(line));
-    drawingsRef.current.horizontals.forEach((line) => series.removePriceLine(line));
-    drawingsRef.current.fibs.forEach((line) => series.removePriceLine(line));
-    drawingsRef.current = { trendlines: [], horizontals: [], fibs: [] };
+    setDrawings({ trendlines: [], horizontals: [], fibs: [] });
     drawPointsRef.current = [];
+  };
+
+  const handleLoadTicker = () => {
+    const next = tickerInput.trim().toUpperCase() || DEFAULT_TICKER;
+    setTickerInput(next);
+    setTicker(next);
   };
 
   const drawHint =
@@ -588,6 +1010,9 @@ export default function App() {
           ? "Draw: click two points for trendline"
           : "Draw: click two points for Fibonacci"
       : null;
+
+  const isIndicatorGroupActive = (group: IndicatorGroup) =>
+    group.keys.every((key) => indicatorVisibility[key]);
 
   const statusText =
     mode === "chart" ? (loading ? "Loading signals..." : "Ready") : scanLoading ? "Scanning tickers..." : "Ready";
@@ -658,12 +1083,18 @@ export default function App() {
                 className="input"
                 value={tickerInput}
                 onChange={(event) => setTickerInput(event.target.value.toUpperCase())}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    handleLoadTicker();
+                  }
+                }}
               />
               <button
                 className="button"
-                onClick={() => setTicker(tickerInput.trim() || "AAPL")}
+                onClick={handleLoadTicker}
+                disabled={loading}
               >
-                Load
+                {loading ? "Loading..." : "Load"}
               </button>
             </div>
           </div>
@@ -688,13 +1119,13 @@ export default function App() {
           <div className="control-group">
             <span className="control-label">Indicators</span>
             <div className="button-group">
-              {INDICATOR_OPTIONS.map((option) => (
+              {INDICATOR_GROUPS.map((group) => (
                 <button
-                  key={option.key}
-                  className={`button ${indicatorVisibility[option.key] ? "active" : ""}`}
-                  onClick={() => toggleIndicator(option.key)}
+                  key={group.label}
+                  className={`button ${isIndicatorGroupActive(group) ? "active" : ""}`}
+                  onClick={() => toggleIndicatorGroup(group.keys)}
                 >
-                  {option.label}
+                  {group.label}
                 </button>
               ))}
             </div>
@@ -750,8 +1181,12 @@ export default function App() {
               >
                 Defaults
               </button>
-              <button className="button" onClick={() => setScanRefresh((v) => v + 1)}>
-                Scan
+              <button
+                className="button"
+                onClick={() => setScanRefresh((v) => v + 1)}
+                disabled={scanLoading}
+              >
+                {scanLoading ? "Scanning..." : "Scan"}
               </button>
             </div>
           </div>

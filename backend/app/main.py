@@ -85,6 +85,12 @@ class Indicator(BaseModel):
     ema200: float
     supertrend: float
     rsi: float
+    vwap: float
+    bb_upper: float
+    bb_middle: float
+    bb_lower: float
+    macd: float
+    macd_signal: float
 
 
 class AnalyzeResponse(BaseModel):
@@ -332,6 +338,19 @@ def compute_rsi(series: pd.Series, length: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
+def compute_macd(
+    series: pd.Series,
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+) -> tuple[pd.Series, pd.Series]:
+    ema_fast = series.ewm(span=fast, adjust=False, min_periods=fast).mean()
+    ema_slow = series.ewm(span=slow, adjust=False, min_periods=slow).mean()
+    macd = ema_fast - ema_slow
+    macd_signal = macd.ewm(span=signal, adjust=False, min_periods=signal).mean()
+    return macd, macd_signal
+
+
 def compute_atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> pd.Series:
     prev_close = close.shift(1)
     tr = pd.concat(
@@ -392,6 +411,20 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ema50"] = compute_ema(df["close"], length=50)
     df["ema200"] = compute_ema(df["close"], length=200)
     df["rsi"] = compute_rsi(df["close"], length=14)
+
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3
+    cumulative_volume = df["volume"].cumsum()
+    df["vwap"] = (typical_price * df["volume"]).cumsum() / cumulative_volume
+
+    bb_middle = df["close"].rolling(window=20, min_periods=20).mean()
+    bb_std = df["close"].rolling(window=20, min_periods=20).std()
+    df["bb_middle"] = bb_middle
+    df["bb_upper"] = bb_middle + 2 * bb_std
+    df["bb_lower"] = bb_middle - 2 * bb_std
+
+    macd, macd_signal = compute_macd(df["close"])
+    df["macd"] = macd
+    df["macd_signal"] = macd_signal
 
     supertrend, supertrend_upper, supertrend_lower = compute_supertrend(
         high=df["high"],
@@ -494,7 +527,23 @@ def build_candles(df: pd.DataFrame) -> List[Candle]:
 
 def build_indicators(df: pd.DataFrame) -> List[Indicator]:
     indicators: List[Indicator] = []
-    valid = df.dropna(subset=["ema9", "ema21", "ema50", "ema200", "supertrend", "rsi", "time"])
+    valid = df.dropna(
+        subset=[
+            "ema9",
+            "ema21",
+            "ema50",
+            "ema200",
+            "supertrend",
+            "rsi",
+            "vwap",
+            "bb_upper",
+            "bb_middle",
+            "bb_lower",
+            "macd",
+            "macd_signal",
+            "time",
+        ]
+    )
     valid = valid.sort_values("time")
     for _, row in valid.iterrows():
         indicators.append(
@@ -506,6 +555,12 @@ def build_indicators(df: pd.DataFrame) -> List[Indicator]:
                 ema200=float(row["ema200"]),
                 supertrend=float(row["supertrend"]),
                 rsi=float(row["rsi"]),
+                vwap=float(row["vwap"]),
+                bb_upper=float(row["bb_upper"]),
+                bb_middle=float(row["bb_middle"]),
+                bb_lower=float(row["bb_lower"]),
+                macd=float(row["macd"]),
+                macd_signal=float(row["macd_signal"]),
             )
         )
     return indicators

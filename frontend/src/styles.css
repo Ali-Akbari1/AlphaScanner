@@ -147,6 +147,11 @@ body {
   color: var(--accent-cyan);
 }
 
+.button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 .button.active {
   border-color: var(--accent-cyan);
   color: var(--accent-cyan);
