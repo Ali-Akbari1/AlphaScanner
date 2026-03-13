@@ -125,6 +125,12 @@ body {
   min-width: 160px;
 }
 
+.input-area {
+  min-width: 260px;
+  min-height: 80px;
+  resize: vertical;
+}
+
 .button {
   background: var(--surface);
   border: 1px solid var(--gridline);
