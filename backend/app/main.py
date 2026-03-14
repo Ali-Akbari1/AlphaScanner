@@ -14,8 +14,12 @@ app = FastAPI(title="AlphaScanner API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1):\d+$",
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://alpha-scanner-ecru.vercel.app",
+    ],
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|.+\.vercel\.app)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
