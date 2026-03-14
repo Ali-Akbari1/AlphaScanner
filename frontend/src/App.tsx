@@ -40,7 +40,7 @@ const FIB_LEVELS = [
 ];
 
 type Interval = (typeof INTERVALS)[number];
-type DrawMode = "none" | "trendline" | "horizontal" | "fibonacci";
+type DrawMode = "none" | "trendline" | "horizontal" | "fibonacci" | "delete";
 type IndicatorKey =
   | "ema9"
   | "ema21"
@@ -99,7 +99,7 @@ type Candle = {
 type Signal = {
   time: number;
   type: "buy" | "sell";
-  strength: "strong";
+  strength: "strong" | "weak";
   conditions: string[];
 };
 
@@ -140,6 +140,7 @@ type StoredSettings = {
   indicatorVisibility: Partial<IndicatorVisibility>;
   scanTickersInput: string;
   drawMode?: DrawMode;
+  showWeakSignals?: boolean;
 };
 
 type AnalyzeResponse = {
@@ -235,6 +236,28 @@ const timeToSeconds = (time: Time) => {
 
 const toTimestamp = (time: Time): UTCTimestamp => timeToSeconds(time) as UTCTimestamp;
 
+const ensureDistinctTimes = (start: DrawPoint, end: DrawPoint) => {
+  if (start.time === end.time) {
+    return { start, end: { ...end, time: (end.time + 1) as UTCTimestamp } };
+  }
+  return { start, end };
+};
+
+const medianStepSeconds = (times: UTCTimestamp[]) => {
+  if (times.length < 2) {
+    return 60 * 60 * 24;
+  }
+  const diffs = times
+    .slice(1)
+    .map((time, idx) => time - times[idx])
+    .filter((diff) => diff > 0)
+    .sort((a, b) => a - b);
+  if (diffs.length === 0) {
+    return 60 * 60 * 24;
+  }
+  return diffs[Math.floor(diffs.length / 2)];
+};
+
 export default function App() {
   const chartContainerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -269,6 +292,20 @@ export default function App() {
     trendline: null,
     fibs: [],
   });
+  const previewFrameRef = useRef<number | null>(null);
+  const pendingMoveRef = useRef<any>(null);
+  const previewCacheRef = useRef<{
+    horizontal?: number;
+    trendline?: { start: DrawPoint; end: DrawPoint };
+    fibEnd?: number;
+  }>({});
+  const candlesRef = useRef<{ times: UTCTimestamp[]; step: number } | null>(null);
+  const hoverRef = useRef<{
+    kind: "trendline" | "horizontal" | "fib";
+    index: number;
+    series?: ISeriesApi<"Line">;
+    line?: ReturnType<ISeriesApi<"Candlestick">["createPriceLine"]>;
+  } | null>(null);
 
   const storedSettings = useMemo(
     () => loadStoredJson<StoredSettings | null>(SETTINGS_KEY, null),
@@ -301,6 +338,9 @@ export default function App() {
     storedSettings?.drawMode ?? "none"
   );
   const [drawings, setDrawings] = useState<DrawingsState>(storedDrawings);
+  const [showWeakSignals, setShowWeakSignals] = useState(
+    storedSettings?.showWeakSignals ?? false
+  );
   const [meta, setMeta] = useState<AnalyzeResponse["meta"] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -335,9 +375,19 @@ export default function App() {
       indicatorVisibility,
       scanTickersInput,
       drawMode,
+      showWeakSignals,
     };
     window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
-  }, [mode, ticker, tickerInput, interval, indicatorVisibility, scanTickersInput, drawMode]);
+  }, [
+    mode,
+    ticker,
+    tickerInput,
+    interval,
+    indicatorVisibility,
+    scanTickersInput,
+    drawMode,
+    showWeakSignals,
+  ]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -567,7 +617,9 @@ export default function App() {
       setError(null);
 
       try {
-        const response = await fetch(`${API_BASE}/analyze/${ticker}/${interval}`);
+        const response = await fetch(
+          `${API_BASE}/analyze/${ticker}/${interval}?weak=${showWeakSignals ? "true" : "false"}`
+        );
         if (!response.ok) {
           let detail = "";
           try {
@@ -593,15 +645,34 @@ export default function App() {
         }));
 
         seriesRef.current.setData(candles);
+        const candleTimes = candles.map((candle) => candle.time);
+        candlesRef.current = {
+          times: candleTimes,
+          step: medianStepSeconds(candleTimes),
+        };
         seriesRef.current.setMarkers(
           data.signals
             .map((signal) => ({
               time: signal.time as UTCTimestamp,
               position: signal.type === "buy" ? "belowBar" : "aboveBar",
-              color: signal.type === "buy" ? "#2EEA8C" : "#FF4D6D",
+              color:
+                signal.type === "buy"
+                  ? signal.strength === "weak"
+                    ? "rgba(46, 234, 140, 0.55)"
+                    : "#2EEA8C"
+                  : signal.strength === "weak"
+                    ? "rgba(255, 77, 109, 0.55)"
+                    : "#FF4D6D",
               shape: signal.type === "buy" ? "arrowUp" : "arrowDown",
-              text: signal.type === "buy" ? "BUY" : "SELL",
-              size: 2,
+              text:
+                signal.strength === "weak"
+                  ? signal.type === "buy"
+                    ? "W BUY"
+                    : "W SELL"
+                  : signal.type === "buy"
+                    ? "BUY"
+                    : "SELL",
+              size: signal.strength === "weak" ? 1 : 2,
             }))
             .sort((a, b) => timeToSeconds(a.time) - timeToSeconds(b.time))
         );
@@ -674,7 +745,7 @@ export default function App() {
     };
 
     load();
-  }, [ticker, interval, mode]);
+  }, [ticker, interval, mode, showWeakSignals]);
 
   useEffect(() => {
     if (mode !== "scanner") {
@@ -730,9 +801,22 @@ export default function App() {
 
   useEffect(() => {
     drawPointsRef.current = [];
+    if (previewFrameRef.current !== null) {
+      cancelAnimationFrame(previewFrameRef.current);
+      previewFrameRef.current = null;
+    }
+    pendingMoveRef.current = null;
+    previewCacheRef.current = {};
     const series = seriesRef.current;
     const chart = chartRef.current;
     if (series && chart) {
+      if (hoverRef.current?.series) {
+        chart.removeSeries(hoverRef.current.series);
+      }
+      if (hoverRef.current?.line) {
+        series.removePriceLine(hoverRef.current.line);
+      }
+      hoverRef.current = null;
       if (previewRef.current.horizontal) {
         series.removePriceLine(previewRef.current.horizontal);
         previewRef.current.horizontal = null;
@@ -759,6 +843,7 @@ export default function App() {
     drawingsRef.current = { trendlines: [], horizontals: [], fibs: [] };
 
     state.trendlines.forEach((trend) => {
+      const normalized = ensureDistinctTimes(trend.start, trend.end);
       const lineSeries = chart.addLineSeries({
         color: "#F6C453",
         lineWidth: 2,
@@ -766,8 +851,8 @@ export default function App() {
         lastValueVisible: false,
       });
       lineSeries.setData([
-        { time: trend.start.time, value: trend.start.price },
-        { time: trend.end.time, value: trend.end.price },
+        { time: normalized.start.time, value: normalized.start.price },
+        { time: normalized.end.time, value: normalized.end.price },
       ]);
       drawingsRef.current.trendlines.push(lineSeries);
     });
@@ -817,95 +902,236 @@ export default function App() {
       return;
     }
 
-    const handleMove = (param: any) => {
-      if (drawMode === "none") {
+    const renderPreview = (param: any) => {
+      try {
+        if (drawMode === "none" || drawMode === "delete") {
+          return;
+        }
+        if (!param.point) {
+          return;
+        }
+
+        const time =
+          param.time ??
+          (chart.timeScale().coordinateToTime(param.point.x) as Time | null) ??
+          null;
+        let resolvedTime = time;
+        if (resolvedTime === null || resolvedTime === undefined) {
+          const logical = chart.timeScale().coordinateToLogical(param.point.x);
+          const ref = candlesRef.current;
+          if (logical !== null && ref && ref.times.length > 0) {
+            const base = ref.times[0];
+            resolvedTime = (base + Math.round(logical) * ref.step) as UTCTimestamp;
+          }
+        }
+        if (resolvedTime === null || resolvedTime === undefined) {
+          return;
+        }
+
+        const price = series.coordinateToPrice(param.point.y);
+        if (price === null || !Number.isFinite(price)) {
+          return;
+        }
+
+        if (drawMode === "horizontal") {
+          const lastPrice = previewCacheRef.current.horizontal;
+          if (lastPrice !== undefined && Math.abs(lastPrice - price) < 1e-6) {
+            return;
+          }
+          if (!previewRef.current.horizontal) {
+            previewRef.current.horizontal = series.createPriceLine({
+              price,
+              color: "#3EE7F7",
+              lineWidth: 1,
+              lineStyle: LineStyle.Dashed,
+              axisLabelVisible: true,
+              title: "H",
+            });
+          } else {
+            previewRef.current.horizontal.applyOptions({ price });
+          }
+          previewCacheRef.current.horizontal = price;
+        } else if (previewRef.current.horizontal) {
+          series.removePriceLine(previewRef.current.horizontal);
+          previewRef.current.horizontal = null;
+          delete previewCacheRef.current.horizontal;
+        }
+
+        if (drawMode === "trendline" && drawPointsRef.current.length === 1) {
+          const start = drawPointsRef.current[0];
+          const end: DrawPoint = { time: toTimestamp(resolvedTime), price };
+          const ordered = start.time <= end.time ? [start, end] : [end, start];
+          const normalized = ensureDistinctTimes(ordered[0], ordered[1]);
+          const lastTrend = previewCacheRef.current.trendline;
+          if (
+            lastTrend &&
+            lastTrend.start.time === normalized.start.time &&
+            lastTrend.end.time === normalized.end.time &&
+            Math.abs(lastTrend.start.price - normalized.start.price) < 1e-6 &&
+            Math.abs(lastTrend.end.price - normalized.end.price) < 1e-6
+          ) {
+            return;
+          }
+          if (!previewRef.current.trendline) {
+            previewRef.current.trendline = chart.addLineSeries({
+              color: "#F6C453",
+              lineWidth: 2,
+              lineStyle: LineStyle.Dashed,
+              priceLineVisible: false,
+              lastValueVisible: false,
+            });
+          }
+          previewRef.current.trendline.setData([
+            { time: normalized.start.time, value: normalized.start.price },
+            { time: normalized.end.time, value: normalized.end.price },
+          ]);
+          previewCacheRef.current.trendline = { start: normalized.start, end: normalized.end };
+        } else if (previewRef.current.trendline) {
+          chart.removeSeries(previewRef.current.trendline);
+          previewRef.current.trendline = null;
+          delete previewCacheRef.current.trendline;
+        }
+
+        if (drawMode === "fibonacci" && drawPointsRef.current.length === 1) {
+          const start = drawPointsRef.current[0];
+          const end: DrawPoint = { time: toTimestamp(resolvedTime), price };
+          const diff = end.price - start.price;
+          const lastEnd = previewCacheRef.current.fibEnd;
+          if (lastEnd !== undefined && Math.abs(lastEnd - end.price) < 1e-6) {
+            return;
+          }
+          if (previewRef.current.fibs.length === 0) {
+            previewRef.current.fibs = FIB_LEVELS.map((item) =>
+              series.createPriceLine({
+                price: start.price + diff * item.level,
+                color: item.level === 0 || item.level === 1 ? "#F6C453" : "#9FB0C3",
+                lineWidth: item.level === 0 || item.level === 1 ? 2 : 1,
+                lineStyle: LineStyle.Dashed,
+                axisLabelVisible: true,
+                title: `Fib ${item.label}`,
+              })
+            );
+          } else {
+            previewRef.current.fibs.forEach((line, idx) => {
+              const item = FIB_LEVELS[idx];
+              line.applyOptions({ price: start.price + diff * item.level });
+            });
+          }
+          previewCacheRef.current.fibEnd = end.price;
+        } else if (previewRef.current.fibs.length > 0) {
+          previewRef.current.fibs.forEach((line) => series.removePriceLine(line));
+          previewRef.current.fibs = [];
+          delete previewCacheRef.current.fibEnd;
+        }
+      } catch (err) {
+        console.warn("Preview draw error", err);
+      }
+    };
+
+    const clearHover = () => {
+      if (!hoverRef.current) {
+        return;
+      }
+      if (hoverRef.current.series) {
+        chart.removeSeries(hoverRef.current.series);
+      }
+      if (hoverRef.current.line) {
+        series.removePriceLine(hoverRef.current.line);
+      }
+      hoverRef.current = null;
+    };
+
+    const renderDeleteHover = (param: any) => {
+      if (drawMode !== "delete") {
         return;
       }
       if (!param.point) {
+        clearHover();
         return;
       }
-
-      const time =
-        param.time ?? (chart.timeScale().coordinateToTime(param.point.x) as Time | null);
-      if (time === null || time === undefined) {
+      const target = findDeletionTarget(param.point.x, param.point.y);
+      if (!target) {
+        clearHover();
         return;
       }
-
-      const price = series.coordinateToPrice(param.point.y);
-      if (price === null) {
+      if (hoverRef.current && hoverRef.current.kind === target.kind && hoverRef.current.index === target.index) {
         return;
       }
-
-      if (drawMode === "horizontal") {
-        if (!previewRef.current.horizontal) {
-          previewRef.current.horizontal = series.createPriceLine({
-            price,
-            color: "#3EE7F7",
-            lineWidth: 1,
-            lineStyle: LineStyle.Dashed,
-            axisLabelVisible: true,
-            title: "H",
-          });
-        } else {
-          previewRef.current.horizontal.applyOptions({ price });
+      clearHover();
+      if (target.kind === "trendline") {
+        const trend = drawings.trendlines[target.index];
+        if (!trend) {
+          return;
         }
-      } else if (previewRef.current.horizontal) {
-        series.removePriceLine(previewRef.current.horizontal);
-        previewRef.current.horizontal = null;
-      }
-
-      if (drawMode === "trendline" && drawPointsRef.current.length === 1) {
-        const start = drawPointsRef.current[0];
-        const end: DrawPoint = { time: toTimestamp(time), price };
-        const ordered = start.time <= end.time ? [start, end] : [end, start];
-        if (!previewRef.current.trendline) {
-          previewRef.current.trendline = chart.addLineSeries({
-            color: "#F6C453",
-            lineWidth: 2,
-            lineStyle: LineStyle.Dashed,
-            priceLineVisible: false,
-            lastValueVisible: false,
-          });
-        }
-        previewRef.current.trendline.setData([
-          { time: ordered[0].time, value: ordered[0].price },
-          { time: ordered[1].time, value: ordered[1].price },
+        const normalized = ensureDistinctTimes(trend.start, trend.end);
+        const highlight = chart.addLineSeries({
+          color: "#FFD166",
+          lineWidth: 3,
+          priceLineVisible: false,
+          lastValueVisible: false,
+        });
+        highlight.setData([
+          { time: normalized.start.time, value: normalized.start.price },
+          { time: normalized.end.time, value: normalized.end.price },
         ]);
-      } else if (previewRef.current.trendline) {
-        chart.removeSeries(previewRef.current.trendline);
-        previewRef.current.trendline = null;
+        hoverRef.current = { kind: "trendline", index: target.index, series: highlight };
+        return;
       }
 
-      if (drawMode === "fibonacci" && drawPointsRef.current.length === 1) {
-        const start = drawPointsRef.current[0];
-        const end: DrawPoint = { time: toTimestamp(time), price };
-        const diff = end.price - start.price;
-        if (previewRef.current.fibs.length === 0) {
-          previewRef.current.fibs = FIB_LEVELS.map((item) =>
-            series.createPriceLine({
-              price: start.price + diff * item.level,
-              color: item.level === 0 || item.level === 1 ? "#F6C453" : "#9FB0C3",
-              lineWidth: item.level === 0 || item.level === 1 ? 2 : 1,
-              lineStyle: LineStyle.Dashed,
-              axisLabelVisible: true,
-              title: `Fib ${item.label}`,
-            })
-          );
-        } else {
-          previewRef.current.fibs.forEach((line, idx) => {
-            const item = FIB_LEVELS[idx];
-            line.applyOptions({ price: start.price + diff * item.level });
-          });
+      if (target.kind === "horizontal") {
+        const horizontal = drawings.horizontals[target.index];
+        if (!horizontal) {
+          return;
         }
-      } else if (previewRef.current.fibs.length > 0) {
-        previewRef.current.fibs.forEach((line) => series.removePriceLine(line));
-        previewRef.current.fibs = [];
+        const line = series.createPriceLine({
+          price: horizontal.price,
+          color: "#FFD166",
+          lineWidth: 3,
+          lineStyle: LineStyle.Solid,
+          axisLabelVisible: false,
+          title: "Delete",
+        });
+        hoverRef.current = { kind: "horizontal", index: target.index, line };
+        return;
       }
+
+      const fib = drawings.fibs[target.index];
+      if (!fib || target.price === undefined) {
+        return;
+      }
+      const line = series.createPriceLine({
+        price: target.price,
+        color: "#FFD166",
+        lineWidth: 3,
+        lineStyle: LineStyle.Solid,
+        axisLabelVisible: false,
+        title: "Delete",
+      });
+      hoverRef.current = { kind: "fib", index: target.index, line };
+    };
+
+    const handleMove = (param: any) => {
+      pendingMoveRef.current = param;
+      if (previewFrameRef.current !== null) {
+        return;
+      }
+      previewFrameRef.current = requestAnimationFrame(() => {
+        previewFrameRef.current = null;
+        const pending = pendingMoveRef.current;
+        pendingMoveRef.current = null;
+        if (pending) {
+          if (drawMode === "delete") {
+            renderDeleteHover(pending);
+          } else {
+            renderPreview(pending);
+          }
+        }
+      });
     };
 
     chart.subscribeCrosshairMove(handleMove);
     return () => chart.unsubscribeCrosshairMove(handleMove);
-  }, [drawMode, mode]);
+  }, [drawMode, mode, drawings]);
 
   useEffect(() => {
     if (mode !== "chart") {
@@ -917,62 +1143,179 @@ export default function App() {
       return;
     }
 
-    const handleClick = (param: any) => {
-      if (drawMode === "none") {
-        return;
-      }
-      if (!param.point) {
-        return;
-      }
+    const pixelTolerance = 10;
 
-      const time =
-        param.time ?? (chart.timeScale().coordinateToTime(param.point.x) as Time | null);
-      if (time === null || time === undefined) {
-        return;
+    const distanceToSegment = (
+      px: number,
+      py: number,
+      x1: number,
+      y1: number,
+      x2: number,
+      y2: number
+    ) => {
+      const dx = x2 - x1;
+      const dy = y2 - y1;
+      if (dx === 0 && dy === 0) {
+        return Math.hypot(px - x1, py - y1);
       }
+      const t = ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy);
+      const clamped = Math.max(0, Math.min(1, t));
+      const cx = x1 + clamped * dx;
+      const cy = y1 + clamped * dy;
+      return Math.hypot(px - cx, py - cy);
+    };
 
-      const price = series.coordinateToPrice(param.point.y);
-      if (price === null) {
-        return;
-      }
+    const findDeletionTarget = (clickX: number, clickY: number) => {
 
-      if (drawMode === "horizontal") {
-        setDrawings((prev) => ({
-          ...prev,
-          horizontals: [...prev.horizontals, { price }],
-        }));
-        return;
-      }
+      let best:
+        | { kind: "trendline"; index: number; distance: number }
+        | { kind: "horizontal"; index: number; distance: number; price: number }
+        | { kind: "fib"; index: number; distance: number; price: number }
+        | null = null;
 
-      const nextPoint: DrawPoint = { time: toTimestamp(time), price };
-      drawPointsRef.current = [...drawPointsRef.current, nextPoint];
-      if (drawPointsRef.current.length < 2) {
-        return;
-      }
-
-      const [pointA, pointB] = drawPointsRef.current.slice(-2);
-      drawPointsRef.current = [];
-      const [start, end] = pointA.time <= pointB.time ? [pointA, pointB] : [pointB, pointA];
-
-      if (drawMode === "trendline") {
-        setDrawings((prev) => ({
-          ...prev,
-          trendlines: [...prev.trendlines, { start, end }],
-        }));
-        if (previewRef.current.trendline) {
-          chart.removeSeries(previewRef.current.trendline);
-          previewRef.current.trendline = null;
+      drawings.trendlines.forEach((trend, index) => {
+        const normalized = ensureDistinctTimes(trend.start, trend.end);
+        const x1 = chart.timeScale().timeToCoordinate(normalized.start.time);
+        const x2 = chart.timeScale().timeToCoordinate(normalized.end.time);
+        const y1 = series.priceToCoordinate(normalized.start.price);
+        const y2 = series.priceToCoordinate(normalized.end.price);
+        if (x1 === null || x2 === null || y1 === null || y2 === null) {
+          return;
         }
-        return;
-      }
+        const distance = distanceToSegment(clickX, clickY, x1, y1, x2, y2);
+        if (distance <= pixelTolerance && (!best || distance < best.distance)) {
+          best = { kind: "trendline", index, distance };
+        }
+      });
 
-      if (drawMode === "fibonacci") {
-        setDrawings((prev) => ({
-          ...prev,
-          fibs: [...prev.fibs, { start, end }],
-        }));
-        previewRef.current.fibs.forEach((line) => series.removePriceLine(line));
-        previewRef.current.fibs = [];
+      drawings.horizontals.forEach((horizontal, index) => {
+        const y = series.priceToCoordinate(horizontal.price);
+        if (y === null) {
+          return;
+        }
+        const distance = Math.abs(clickY - y);
+        if (distance <= pixelTolerance && (!best || distance < best.distance)) {
+          best = { kind: "horizontal", index, distance, price: horizontal.price };
+        }
+      });
+
+      drawings.fibs.forEach((fib, index) => {
+        const diff = fib.end.price - fib.start.price;
+        FIB_LEVELS.forEach((item) => {
+          const y = series.priceToCoordinate(fib.start.price + diff * item.level);
+          if (y === null) {
+            return;
+          }
+          const distance = Math.abs(clickY - y);
+          if (distance <= pixelTolerance && (!best || distance < best.distance)) {
+            best = {
+              kind: "fib",
+              index,
+              distance,
+              price: fib.start.price + diff * item.level,
+            };
+          }
+        });
+      });
+
+      return best;
+    };
+
+    const handleClick = (param: any) => {
+      try {
+        if (drawMode === "none" || drawMode === "delete") {
+          if (!param.point) {
+            return;
+          }
+          const target = findDeletionTarget(param.point.x, param.point.y);
+          if (!target) {
+            return;
+          }
+          if (target.kind === "trendline") {
+            setDrawings((prev) => ({
+              ...prev,
+              trendlines: prev.trendlines.filter((_, idx) => idx !== target.index),
+            }));
+          } else if (target.kind === "horizontal") {
+            setDrawings((prev) => ({
+              ...prev,
+              horizontals: prev.horizontals.filter((_, idx) => idx !== target.index),
+            }));
+          } else {
+            setDrawings((prev) => ({
+              ...prev,
+              fibs: prev.fibs.filter((_, idx) => idx !== target.index),
+            }));
+          }
+          return;
+        }
+        if (!param.point) {
+          return;
+        }
+
+        const time =
+          param.time ??
+          (chart.timeScale().coordinateToTime(param.point.x) as Time | null) ??
+          null;
+        let resolvedTime = time;
+        if (resolvedTime === null || resolvedTime === undefined) {
+          const logical = chart.timeScale().coordinateToLogical(param.point.x);
+          const ref = candlesRef.current;
+          if (logical !== null && ref && ref.times.length > 0) {
+            const base = ref.times[0];
+            resolvedTime = (base + Math.round(logical) * ref.step) as UTCTimestamp;
+          }
+        }
+        if (resolvedTime === null || resolvedTime === undefined) {
+          return;
+        }
+
+        const price = series.coordinateToPrice(param.point.y);
+        if (price === null || !Number.isFinite(price)) {
+          return;
+        }
+
+        if (drawMode === "horizontal") {
+          setDrawings((prev) => ({
+            ...prev,
+            horizontals: [...prev.horizontals, { price }],
+          }));
+          return;
+        }
+
+        const nextPoint: DrawPoint = { time: toTimestamp(resolvedTime), price };
+        drawPointsRef.current = [...drawPointsRef.current, nextPoint];
+        if (drawPointsRef.current.length < 2) {
+          return;
+        }
+
+        const [pointA, pointB] = drawPointsRef.current.slice(-2);
+        drawPointsRef.current = [];
+        const [startRaw, endRaw] = pointA.time <= pointB.time ? [pointA, pointB] : [pointB, pointA];
+        const { start, end } = ensureDistinctTimes(startRaw, endRaw);
+
+        if (drawMode === "trendline") {
+          setDrawings((prev) => ({
+            ...prev,
+            trendlines: [...prev.trendlines, { start, end }],
+          }));
+          if (previewRef.current.trendline) {
+            chart.removeSeries(previewRef.current.trendline);
+            previewRef.current.trendline = null;
+          }
+          return;
+        }
+
+        if (drawMode === "fibonacci") {
+          setDrawings((prev) => ({
+            ...prev,
+            fibs: [...prev.fibs, { start, end }],
+          }));
+          previewRef.current.fibs.forEach((line) => series.removePriceLine(line));
+          previewRef.current.fibs = [];
+        }
+      } catch (err) {
+        console.warn("Draw click error", err);
       }
     };
 
@@ -1004,11 +1347,13 @@ export default function App() {
 
   const drawHint =
     mode === "chart" && drawMode !== "none"
-      ? drawMode === "horizontal"
-        ? "Draw: click once for horizontal line"
-        : drawMode === "trendline"
-          ? "Draw: click two points for trendline"
-          : "Draw: click two points for Fibonacci"
+      ? drawMode === "delete"
+        ? "Delete: click a line to remove"
+        : drawMode === "horizontal"
+          ? "Draw: click once for horizontal line"
+          : drawMode === "trendline"
+            ? "Draw: click two points for trendline"
+            : "Draw: click two points for Fibonacci"
       : null;
 
   const isIndicatorGroupActive = (group: IndicatorGroup) =>
@@ -1134,10 +1479,25 @@ export default function App() {
 
         {mode === "chart" ? (
           <div className="control-group">
+            <span className="control-label">Signals</span>
+            <div className="button-group">
+              <button
+                className={`button ${showWeakSignals ? "active" : ""}`}
+                onClick={() => setShowWeakSignals((prev) => !prev)}
+              >
+                Weak Signals
+              </button>
+            </div>
+          </div>
+        ) : null}
+
+        {mode === "chart" ? (
+          <div className="control-group">
             <span className="control-label">Draw</span>
             <div className="button-group">
               {[
                 { value: "none" as DrawMode, label: "Off" },
+                { value: "delete" as DrawMode, label: "Delete" },
                 { value: "trendline" as DrawMode, label: "Trendline" },
                 { value: "horizontal" as DrawMode, label: "Horizontal" },
                 { value: "fibonacci" as DrawMode, label: "Fibonacci" },

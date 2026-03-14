@@ -73,7 +73,7 @@ class Candle(BaseModel):
 class Signal(BaseModel):
     time: int
     type: Literal["buy", "sell"]
-    strength: Literal["strong"]
+    strength: Literal["strong", "weak"]
     conditions: List[str]
 
 
@@ -472,8 +472,8 @@ def _build_time_index(index: pd.Index, length: int) -> pd.Series:
     return pd.Series(times, index=index)
 
 
-def build_signals(df: pd.DataFrame) -> List[Signal]:
-    df = df.dropna(subset=["close", "ema200", "rsi", "supertrend", "time"])
+def build_signals(df: pd.DataFrame, include_weak: bool = False) -> List[Signal]:
+    df = df.dropna(subset=["close", "ema200", "rsi", "supertrend", "time", "ema9", "ema21"])
     if df.empty:
         return []
     df = df.sort_values("time")
@@ -489,22 +489,58 @@ def build_signals(df: pd.DataFrame) -> List[Signal]:
     momentum_up = (df["rsi"].shift(1) < 30) & (df["rsi"] >= 30)
     momentum_down = (df["rsi"].shift(1) > 70) & (df["rsi"] <= 70)
 
-    buy_mask = trend_up & volatility_up & momentum_up
-    sell_mask = trend_down & volatility_down & momentum_down
+    strong_buy = trend_up & volatility_up & momentum_up
+    strong_sell = trend_down & volatility_down & momentum_down
 
-    signals: List[Signal] = []
-    for _, row in df.loc[buy_mask | sell_mask].iterrows():
-        signal_type = "buy" if buy_mask.loc[row.name] else "sell"
-        signals.append(
-            Signal(
+    signals_by_key: dict[tuple[int, str], Signal] = {}
+    for _, row in df.loc[strong_buy | strong_sell].iterrows():
+        signal_type = "buy" if strong_buy.loc[row.name] else "sell"
+        signal = Signal(
+            time=int(row["time"]),
+            type=signal_type,
+            strength="strong",
+            conditions=["trend", "volatility", "momentum"],
+        )
+        signals_by_key[(signal.time, signal.type)] = signal
+
+    if include_weak:
+        ema_cross_up = (df["ema9"].shift(1) <= df["ema21"].shift(1)) & (df["ema9"] > df["ema21"])
+        ema_cross_down = (df["ema9"].shift(1) >= df["ema21"].shift(1)) & (df["ema9"] < df["ema21"])
+
+        st_flip_up = (df["close"].shift(1) <= df["supertrend"].shift(1)) & (df["close"] > df["supertrend"])
+        st_flip_down = (df["close"].shift(1) >= df["supertrend"].shift(1)) & (df["close"] < df["supertrend"])
+
+        rsi_mid_up = (df["rsi"].shift(1) < 50) & (df["rsi"] >= 50)
+        rsi_mid_down = (df["rsi"].shift(1) > 50) & (df["rsi"] <= 50)
+
+        weak_buy = ema_cross_up | st_flip_up | rsi_mid_up
+        weak_sell = ema_cross_down | st_flip_down | rsi_mid_down
+
+        for _, row in df.loc[weak_buy | weak_sell].iterrows():
+            signal_type = "buy" if weak_buy.loc[row.name] else "sell"
+            signal = Signal(
                 time=int(row["time"]),
                 type=signal_type,
-                strength="strong",
-                conditions=["trend", "volatility", "momentum"],
+                strength="weak",
+                conditions=["ema_cross", "supertrend_flip", "rsi_mid"],
             )
-        )
+            key = (signal.time, signal.type)
+            if key not in signals_by_key:
+                signals_by_key[key] = signal
 
-    return signals
+    signals = sorted(signals_by_key.values(), key=lambda signal: signal.time)
+    if not include_weak:
+        return signals
+
+    filtered: List[Signal] = []
+    last_type: Optional[Literal["buy", "sell"]] = None
+    for signal in signals:
+        if signal.strength == "weak" and signal.type == last_type:
+            continue
+        filtered.append(signal)
+        last_type = signal.type
+
+    return filtered
 
 
 def build_candles(df: pd.DataFrame) -> List[Candle]:
@@ -646,7 +682,11 @@ def summarize_ticker_from_df(ticker: str, df: pd.DataFrame) -> ScanResult:
 
 
 @app.get("/analyze/{ticker}/{interval}", response_model=AnalyzeResponse)
-def analyze(ticker: str, interval: str) -> AnalyzeResponse:
+def analyze(
+    ticker: str,
+    interval: str,
+    weak: bool = Query(default=False, description="Include weak signals"),
+) -> AnalyzeResponse:
     df = fetch_ohlcv(ticker, interval)
     df = add_indicators(df)
 
@@ -654,7 +694,7 @@ def analyze(ticker: str, interval: str) -> AnalyzeResponse:
     if not candles:
         raise HTTPException(status_code=404, detail="Not enough data after indicator calculation.")
 
-    signals = build_signals(df)
+    signals = build_signals(df, include_weak=weak)
     indicators = build_indicators(df)
 
     meta = Meta(ticker=ticker.upper(), interval=interval, rows=len(candles))
