@@ -3,5 +3,3 @@ uvicorn[standard]==0.29.0
 pandas==2.2.2
 numpy==1.26.4
 yfinance==0.2.37
-PYTHON_VERSION=3.11.9
-
