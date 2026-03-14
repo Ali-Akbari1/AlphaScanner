@@ -181,6 +181,9 @@ def fetch_ohlcv(ticker: str, interval: str) -> pd.DataFrame:
     df = normalize_ohlcv(raw_df)
 
     if df.empty:
+        df = normalize_ohlcv(fetch_ohlcv_chart(ticker, period, yf_interval))
+
+    if df.empty:
         df = normalize_ohlcv(fetch_ohlcv_history(ticker, period, yf_interval))
 
     if df.empty and interval == "1d" and period != "1y":
@@ -207,6 +210,38 @@ def fetch_ohlcv_history(ticker: str, period: str, interval: str) -> pd.DataFrame
     except Exception:
         return pd.DataFrame()
     return history
+
+
+def fetch_ohlcv_chart(ticker: str, period: str, interval: str) -> pd.DataFrame:
+    try:
+        response = _YF_SESSION.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
+            params={
+                "interval": interval,
+                "range": period,
+                "includePrePost": "false",
+                "events": "div,splits",
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        return pd.DataFrame()
+
+    result = payload.get("chart", {}).get("result")
+    if not result:
+        return pd.DataFrame()
+
+    data = result[0] or {}
+    timestamps = data.get("timestamp")
+    quote = (data.get("indicators", {}).get("quote") or [None])[0] or {}
+
+    if not timestamps or not quote:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(quote, index=pd.to_datetime(timestamps, unit="s", utc=True))
+    return df
 
 
 def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
