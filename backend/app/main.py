@@ -1,10 +1,12 @@
 ﻿from __future__ import annotations
 
+import os
 import time
 from typing import List, Literal, Optional
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -57,6 +59,31 @@ DEFAULT_TICKERS = [
 MAX_TICKERS = 20
 CACHE_TTL_SECONDS = 60
 _ohlcv_cache: dict[tuple[str, str], tuple[float, pd.DataFrame]] = {}
+
+_YF_SESSION = requests.Session()
+_YF_SESSION.headers.update(
+    {
+        "User-Agent": os.getenv(
+            "YF_USER_AGENT",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        )
+    }
+)
+
+
+def _yf_download(*args, **kwargs) -> pd.DataFrame:
+    try:
+        return yf.download(*args, session=_YF_SESSION, **kwargs)
+    except TypeError:
+        return yf.download(*args, **kwargs)
+
+
+def _yf_ticker(ticker: str) -> yf.Ticker:
+    try:
+        return yf.Ticker(ticker, session=_YF_SESSION)
+    except TypeError:
+        return yf.Ticker(ticker)
 
 
 class Meta(BaseModel):
@@ -142,7 +169,7 @@ def fetch_ohlcv(ticker: str, interval: str) -> pd.DataFrame:
         raise HTTPException(status_code=400, detail=f"Unsupported interval: {interval}")
 
     period = PERIOD_MAP[interval]
-    raw_df = yf.download(
+    raw_df = _yf_download(
         ticker,
         period=period,
         interval=yf_interval,
@@ -172,7 +199,7 @@ def fetch_ohlcv(ticker: str, interval: str) -> pd.DataFrame:
 
 def fetch_ohlcv_history(ticker: str, period: str, interval: str) -> pd.DataFrame:
     try:
-        history = yf.Ticker(ticker).history(
+        history = _yf_ticker(ticker).history(
             period=period,
             interval=interval,
             auto_adjust=False,
