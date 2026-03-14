@@ -176,10 +176,49 @@ body {
   border: 1px solid var(--gridline);
   border-radius: 18px;
   padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
 .chart {
   width: 100%;
+}
+
+.chart-panel {
+  position: relative;
+}
+
+.chart-overlay {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(15, 20, 26, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: var(--text-secondary);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 12px;
+  letter-spacing: 0.3px;
+  backdrop-filter: blur(6px);
+}
+
+.chart-primary {
+  min-height: 520px;
+}
+
+.chart-rsi-shell {
+  border-top: 1px solid var(--gridline);
+  padding-top: 12px;
+}
+
+.chart-rsi-shell.is-hidden {
+  display: none;
+}
+
+.chart-rsi {
+  height: 170px;
 }
 
 .chip {

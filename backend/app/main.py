@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import math
 import os
 import time
 from typing import List, Literal, Optional
@@ -32,14 +33,26 @@ INTERVAL_MAP = {
     "4h": "4h",
     "1d": "1d",
     "1w": "1wk",
+    "1mo": "1mo",
 }
 
 PERIOD_MAP = {
-    "1h": "60d",
-    "4h": "180d",
+    "1h": "2y",
+    "4h": "2y",
     "1d": "max",
     "1w": "max",
+    "1mo": "max",
 }
+
+INTERVAL_SECONDS = {
+    "1h": 60 * 60,
+    "4h": 4 * 60 * 60,
+    "1d": 24 * 60 * 60,
+    "1w": 7 * 24 * 60 * 60,
+    "1mo": 30 * 24 * 60 * 60,
+}
+
+INTRADAY_PERIODS = ["2y", "1y", "6mo", "3mo", "60d", "30d", "14d", "7d"]
 
 DEFAULT_TICKERS = [
     "BTC-USD",
@@ -110,18 +123,18 @@ class Signal(BaseModel):
 
 class Indicator(BaseModel):
     time: int
-    ema9: float
-    ema21: float
-    ema50: float
-    ema200: float
-    supertrend: float
-    rsi: float
-    vwap: float
-    bb_upper: float
-    bb_middle: float
-    bb_lower: float
-    macd: float
-    macd_signal: float
+    ema9: Optional[float]
+    ema21: Optional[float]
+    ema50: Optional[float]
+    ema200: Optional[float]
+    supertrend: Optional[float]
+    rsi: Optional[float]
+    vwap: Optional[float]
+    bb_upper: Optional[float]
+    bb_middle: Optional[float]
+    bb_lower: Optional[float]
+    macd: Optional[float]
+    macd_signal: Optional[float]
 
 
 class AnalyzeResponse(BaseModel):
@@ -168,23 +181,37 @@ def fetch_ohlcv(ticker: str, interval: str) -> pd.DataFrame:
     if not yf_interval:
         raise HTTPException(status_code=400, detail=f"Unsupported interval: {interval}")
 
-    period = PERIOD_MAP[interval]
-    raw_df = _yf_download(
-        ticker,
-        period=period,
-        interval=yf_interval,
-        auto_adjust=False,
-        progress=False,
-        threads=False,
-    )
+    if interval in {"1h", "4h"}:
+        raw_df = fetch_intraday_ohlcv(ticker, yf_interval, INTERVAL_SECONDS[interval])
+    else:
+        period = PERIOD_MAP[interval]
+        try:
+            raw_df = _yf_download(
+                ticker,
+                period=period,
+                interval=yf_interval,
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+        except Exception:
+            raw_df = pd.DataFrame()
 
     df = normalize_ohlcv(raw_df)
 
     if df.empty:
+        period = PERIOD_MAP[interval]
         df = normalize_ohlcv(fetch_ohlcv_chart(ticker, period, yf_interval))
 
     if df.empty:
+        period = PERIOD_MAP[interval]
         df = normalize_ohlcv(fetch_ohlcv_history(ticker, period, yf_interval))
+
+    if df.empty and interval in {"1h", "4h"}:
+        for fallback in ("2y", "1y", "6mo", "3mo", "60d"):
+            df = normalize_ohlcv(fetch_ohlcv_history(ticker, fallback, yf_interval))
+            if not df.empty:
+                break
 
     if df.empty and interval == "1d" and period != "1y":
         df = normalize_ohlcv(fetch_ohlcv_history(ticker, "1y", yf_interval))
@@ -196,6 +223,7 @@ def fetch_ohlcv(ticker: str, interval: str) -> pd.DataFrame:
         )
 
     df = normalize_ohlcv(df)
+    df = resample_ohlcv(df, interval)
     _ohlcv_cache[cache_key] = (time.time(), df.copy())
     return df
 
@@ -244,6 +272,42 @@ def fetch_ohlcv_chart(ticker: str, period: str, interval: str) -> pd.DataFrame:
     return df
 
 
+def fetch_intraday_ohlcv(ticker: str, yf_interval: str, expected_seconds: int) -> pd.DataFrame:
+    best_df = pd.DataFrame()
+    best_step = None
+
+    for period in INTRADAY_PERIODS:
+        df = pd.DataFrame()
+        try:
+            df = _yf_download(
+                ticker,
+                period=period,
+                interval=yf_interval,
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+        except Exception:
+            df = pd.DataFrame()
+
+        df = normalize_ohlcv(df)
+        if df.empty:
+            df = normalize_ohlcv(fetch_ohlcv_chart(ticker, period, yf_interval))
+
+        step = _median_step_seconds(df.index)
+        if df.empty or step is None:
+            continue
+
+        if step <= expected_seconds * 1.6:
+            return df
+
+        if best_step is None or step < best_step:
+            best_step = step
+            best_df = df
+
+    return best_df
+
+
 def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -287,6 +351,39 @@ def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     if not df.index.is_monotonic_increasing:
         df = df.sort_index()
     return df
+
+
+def _median_step_seconds(index: pd.Index) -> Optional[float]:
+    if not isinstance(index, pd.DatetimeIndex):
+        return None
+    if len(index) < 2:
+        return None
+    times = (index.view("int64") // 10**9).astype("int64")
+    diffs = np.diff(times)
+    diffs = diffs[diffs > 0]
+    if diffs.size == 0:
+        return None
+    return float(np.median(diffs))
+
+
+def resample_ohlcv(df: pd.DataFrame, interval: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    if interval not in {"1w", "1mo"}:
+        return df
+
+    rule = "W" if interval == "1w" else "ME"
+    ohlcv = df[["open", "high", "low", "close", "volume"]]
+    resampled = ohlcv.resample(rule, label="right", closed="right").agg(
+        {
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum",
+        }
+    )
+    return resampled.dropna(subset=["open", "high", "low", "close"])
 
 
 def _select_ohlcv_level(columns: pd.MultiIndex) -> Optional[int]:
@@ -352,15 +449,18 @@ def fetch_ohlcv_batch(tickers: List[str], interval: str) -> dict[str, pd.DataFra
     if not missing:
         return results
 
-    downloaded = yf.download(
-        " ".join(missing),
-        period=period,
-        interval=yf_interval,
-        group_by="ticker",
-        auto_adjust=False,
-        progress=False,
-        threads=False,
-    )
+    try:
+        downloaded = _yf_download(
+            " ".join(missing),
+            period=period,
+            interval=yf_interval,
+            group_by="ticker",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+    except Exception:
+        downloaded = pd.DataFrame()
 
     if downloaded.empty:
         for ticker in missing:
@@ -375,12 +475,14 @@ def fetch_ohlcv_batch(tickers: List[str], interval: str) -> dict[str, pd.DataFra
             else:
                 df = pd.DataFrame()
             df = normalize_ohlcv(df)
+            df = resample_ohlcv(df, interval)
             results[ticker] = df
             if not df.empty:
                 _ohlcv_cache[(ticker.upper(), interval)] = (time.time(), df.copy())
     else:
         ticker = missing[0]
         df = normalize_ohlcv(downloaded.copy())
+        df = resample_ohlcv(df, interval)
         results[ticker] = df
         if not df.empty:
             _ohlcv_cache[(ticker.upper(), interval)] = (time.time(), df.copy())
@@ -470,7 +572,7 @@ def compute_supertrend(
     return supertrend, final_upper, final_lower
 
 
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def add_indicators(df: pd.DataFrame, interval: str = "1d") -> pd.DataFrame:
     df = df.copy()
     df["ema9"] = compute_ema(df["close"], length=9)
     df["ema21"] = compute_ema(df["close"], length=21)
@@ -505,11 +607,11 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["supertrend_lower"] = supertrend_lower
 
     df = df.replace([np.inf, -np.inf], np.nan)
-    df["time"] = _build_time_index(df.index, len(df))
+    df["time"] = _build_time_index(df.index, len(df), interval)
     return df
 
 
-def _build_time_index(index: pd.Index, length: int) -> pd.Series:
+def _build_time_index(index: pd.Index, length: int, interval: str) -> pd.Series:
     times: Optional[np.ndarray] = None
 
     if isinstance(index, pd.PeriodIndex):
@@ -522,18 +624,29 @@ def _build_time_index(index: pd.Index, length: int) -> pd.Series:
         if isinstance(parsed, pd.DatetimeIndex) and not parsed.isna().any():
             times = (parsed.view("int64") // 10**9).astype("int64")
 
+    if times is not None and length > 1:
+        diffs = np.diff(times)
+        diffs = diffs[diffs > 0]
+        if diffs.size > 0:
+            median = float(np.median(diffs))
+            expected = INTERVAL_SECONDS.get(interval, 60 * 60 * 24)
+            if median < expected * 0.5:
+                times = None
+
     if times is None:
-        # Fallback to a synthetic daily cadence ending now to keep charts usable.
-        step = 60 * 60 * 24
+        # Fallback to a synthetic cadence ending now to keep charts usable.
+        step = INTERVAL_SECONDS.get(interval, 60 * 60 * 24)
         end = int(time.time())
         start = end - max(length - 1, 0) * step
         times = np.arange(start, start + length * step, step, dtype="int64")
 
     if length > 1 and (np.diff(times) <= 0).any():
-        step = 60 * 60 * 24
-        end = int(time.time())
-        start = end - max(length - 1, 0) * step
-        times = np.arange(start, start + length * step, step, dtype="int64")
+        # Ensure strictly increasing timestamps without discarding data.
+        fixed = times.copy()
+        for idx in range(1, len(fixed)):
+            if fixed[idx] <= fixed[idx - 1]:
+                fixed[idx] = fixed[idx - 1] + 1
+        times = fixed
 
     return pd.Series(times, index=index)
 
@@ -629,40 +742,31 @@ def build_candles(df: pd.DataFrame) -> List[Candle]:
 
 def build_indicators(df: pd.DataFrame) -> List[Indicator]:
     indicators: List[Indicator] = []
-    valid = df.dropna(
-        subset=[
-            "ema9",
-            "ema21",
-            "ema50",
-            "ema200",
-            "supertrend",
-            "rsi",
-            "vwap",
-            "bb_upper",
-            "bb_middle",
-            "bb_lower",
-            "macd",
-            "macd_signal",
-            "time",
-        ]
-    )
-    valid = valid.sort_values("time")
+    valid = df.dropna(subset=["time"]).sort_values("time")
+
+    def safe_float(value: object) -> Optional[float]:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        return result if math.isfinite(result) else None
+
     for _, row in valid.iterrows():
         indicators.append(
             Indicator(
                 time=int(row["time"]),
-                ema9=float(row["ema9"]),
-                ema21=float(row["ema21"]),
-                ema50=float(row["ema50"]),
-                ema200=float(row["ema200"]),
-                supertrend=float(row["supertrend"]),
-                rsi=float(row["rsi"]),
-                vwap=float(row["vwap"]),
-                bb_upper=float(row["bb_upper"]),
-                bb_middle=float(row["bb_middle"]),
-                bb_lower=float(row["bb_lower"]),
-                macd=float(row["macd"]),
-                macd_signal=float(row["macd_signal"]),
+                ema9=safe_float(row.get("ema9")),
+                ema21=safe_float(row.get("ema21")),
+                ema50=safe_float(row.get("ema50")),
+                ema200=safe_float(row.get("ema200")),
+                supertrend=safe_float(row.get("supertrend")),
+                rsi=safe_float(row.get("rsi")),
+                vwap=safe_float(row.get("vwap")),
+                bb_upper=safe_float(row.get("bb_upper")),
+                bb_middle=safe_float(row.get("bb_middle")),
+                bb_lower=safe_float(row.get("bb_lower")),
+                macd=safe_float(row.get("macd")),
+                macd_signal=safe_float(row.get("macd_signal")),
             )
         )
     return indicators
@@ -671,7 +775,7 @@ def build_indicators(df: pd.DataFrame) -> List[Indicator]:
 def summarize_ticker(ticker: str, interval: str) -> ScanResult:
     try:
         df = fetch_ohlcv(ticker, interval)
-        return summarize_ticker_from_df(ticker, df)
+        return summarize_ticker_from_df(ticker, df, interval)
     except HTTPException as exc:
         return ScanResult(
             ticker=ticker.upper(),
@@ -700,11 +804,11 @@ def summarize_ticker(ticker: str, interval: str) -> ScanResult:
         )
 
 
-def summarize_ticker_from_df(ticker: str, df: pd.DataFrame) -> ScanResult:
+def summarize_ticker_from_df(ticker: str, df: pd.DataFrame, interval: str = "1d") -> ScanResult:
     if df.empty:
         raise HTTPException(status_code=404, detail=f"No data for ticker: {ticker}")
 
-    df = add_indicators(df)
+    df = add_indicators(df, interval)
 
     signals = build_signals(df)
     closes = df["close"].dropna()
@@ -753,8 +857,13 @@ def analyze(
     interval: str,
     weak: bool = Query(default=False, description="Include weak signals"),
 ) -> AnalyzeResponse:
-    df = fetch_ohlcv(ticker, interval)
-    df = add_indicators(df)
+    try:
+        df = fetch_ohlcv(ticker, interval)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Upstream data error: {exc}") from exc
+    df = add_indicators(df, interval)
 
     candles = build_candles(df)
     if not candles:
@@ -793,7 +902,42 @@ async def scan(
         raise HTTPException(status_code=400, detail=f"Too many tickers. Max is {MAX_TICKERS}.")
 
     data_by_ticker = fetch_ohlcv_batch(deduped, interval)
-    results = [summarize_ticker_from_df(ticker, data_by_ticker.get(ticker, pd.DataFrame())) for ticker in deduped]
+    results: List[ScanResult] = []
+    for ticker in deduped:
+        try:
+            result = summarize_ticker_from_df(ticker, data_by_ticker.get(ticker, pd.DataFrame()), interval)
+        except HTTPException as exc:
+            results.append(
+                ScanResult(
+                    ticker=ticker.upper(),
+                    latest_close=None,
+                    last_signal_time=None,
+                    last_signal_type=None,
+                    last_signal_strength=None,
+                    bias_type=None,
+                    bias_time=None,
+                    signal_count=0,
+                    status="error",
+                    error=str(exc.detail),
+                )
+            )
+        except Exception as exc:  # pragma: no cover - safety net
+            results.append(
+                ScanResult(
+                    ticker=ticker.upper(),
+                    latest_close=None,
+                    last_signal_time=None,
+                    last_signal_type=None,
+                    last_signal_strength=None,
+                    bias_type=None,
+                    bias_time=None,
+                    signal_count=0,
+                    status="error",
+                    error=str(exc),
+                )
+            )
+        else:
+            results.append(result)
 
     meta = ScanMeta(interval=interval, tickers=deduped, total=len(deduped))
     return ScanResponse(meta=meta, results=results)

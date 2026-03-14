@@ -11,7 +11,7 @@ import {
 } from "lightweight-charts";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
-const INTERVALS = ["1h", "4h", "1d", "1w"] as const;
+const INTERVALS = ["1h", "4h", "1d", "1w", "1mo"] as const;
 const DEFAULT_TICKER = "BTC-USD";
 const SETTINGS_KEY = "alphascanner:settings";
 const DRAWINGS_KEY = "alphascanner:drawings";
@@ -29,6 +29,82 @@ const DEFAULT_SCAN_TICKERS = [
   "QQQ",
   "NFLX",
 ];
+const TICKER_SUGGESTIONS = Array.from(
+  new Set([
+    DEFAULT_TICKER,
+    ...DEFAULT_SCAN_TICKERS,
+    "AMD",
+    "INTC",
+    "ORCL",
+    "CRM",
+    "ADBE",
+    "PYPL",
+    "DIS",
+    "NFLX",
+    "KO",
+    "PEP",
+    "MCD",
+    "COST",
+    "WMT",
+    "HD",
+    "LOW",
+    "NKE",
+    "JPM",
+    "BAC",
+    "WFC",
+    "GS",
+    "V",
+    "MA",
+    "SQ",
+    "SHOP",
+    "UBER",
+    "LYFT",
+    "SNAP",
+    "ROKU",
+    "PLTR",
+    "SOFI",
+    "RIVN",
+    "LCID",
+    "XOM",
+    "CVX",
+    "COP",
+    "CAT",
+    "GE",
+    "BA",
+    "UNH",
+    "JNJ",
+    "PFE",
+    "LLY",
+    "MRK",
+    "ABBV",
+    "TMO",
+    "GOOG",
+    "USO",
+    "GLD",
+    "SLV",
+    "IWM",
+    "DIA",
+    "EEM",
+    "IEMG",
+    "ARKQ",
+    "ARKG",
+    "SMH",
+    "SOXX",
+    "XBI",
+    "XLV",
+    "XLY",
+    "XLP",
+    "XLI",
+    "XLU",
+    "XLF",
+    "XLE",
+    "XLK",
+    "VTI",
+    "ARKK",
+    "TSM",
+    "AVGO",
+  ])
+).sort();
 const FIB_LEVELS = [
   { level: 0, label: "0" },
   { level: 0.236, label: "0.236" },
@@ -38,6 +114,8 @@ const FIB_LEVELS = [
   { level: 0.786, label: "0.786" },
   { level: 1, label: "1" },
 ];
+const DELETE_TOLERANCE_HOVER = 14;
+const DELETE_TOLERANCE_CLICK = 12;
 
 type Interval = (typeof INTERVALS)[number];
 type DrawMode = "none" | "trendline" | "horizontal" | "fibonacci" | "delete";
@@ -105,18 +183,18 @@ type Signal = {
 
 type Indicator = {
   time: number;
-  ema9: number;
-  ema21: number;
-  ema50: number;
-  ema200: number;
-  supertrend: number;
-  rsi: number;
-  vwap: number;
-  bb_upper: number;
-  bb_middle: number;
-  bb_lower: number;
-  macd: number;
-  macd_signal: number;
+  ema9: number | null;
+  ema21: number | null;
+  ema50: number | null;
+  ema200: number | null;
+  supertrend: number | null;
+  rsi: number | null;
+  vwap: number | null;
+  bb_upper: number | null;
+  bb_middle: number | null;
+  bb_lower: number | null;
+  macd: number | null;
+  macd_signal: number | null;
 };
 
 type IndicatorVisibility = Record<IndicatorKey, boolean>;
@@ -131,6 +209,10 @@ type DrawingsState = {
   horizontals: { price: number }[];
   fibs: { start: DrawPoint; end: DrawPoint }[];
 };
+type DeleteTarget =
+  | { kind: "trendline"; index: number; distance: number }
+  | { kind: "horizontal"; index: number; distance: number; price: number }
+  | { kind: "fib"; index: number; distance: number; price: number };
 
 type StoredSettings = {
   mode: "chart" | "scanner";
@@ -243,6 +325,56 @@ const ensureDistinctTimes = (start: DrawPoint, end: DrawPoint) => {
   return { start, end };
 };
 
+const formatAxisTime = (time: Time, showTime: boolean) => {
+  let date: Date;
+  if (typeof time === "number") {
+    date = new Date(time * 1000);
+  } else {
+    date = new Date(Date.UTC(time.year, time.month - 1, time.day));
+  }
+  if (showTime) {
+    return date.toISOString().replace("T", " ").slice(0, 16);
+  }
+  return date.toISOString().slice(0, 10);
+};
+
+const inferResolution = (times: UTCTimestamp[]) => {
+  if (times.length < 2) {
+    return null;
+  }
+  const diffs = times
+    .slice(1)
+    .map((time, idx) => time - times[idx])
+    .filter((diff) => diff > 0)
+    .sort((a, b) => a - b);
+  if (diffs.length === 0) {
+    return null;
+  }
+  const median = diffs[Math.floor(diffs.length / 2)];
+  const candidates = [
+    { label: "1h", seconds: 60 * 60 },
+    { label: "4h", seconds: 4 * 60 * 60 },
+    { label: "1d", seconds: 24 * 60 * 60 },
+    { label: "1w", seconds: 7 * 24 * 60 * 60 },
+    { label: "1mo", seconds: 30 * 24 * 60 * 60 },
+  ];
+  const closest = candidates.reduce((best, candidate) => {
+    const diff = Math.abs(median - candidate.seconds);
+    if (!best || diff < best.diff) {
+      return { label: candidate.label, diff };
+    }
+    return best;
+  }, null as { label: string; diff: number } | null);
+  if (!closest) {
+    return null;
+  }
+  if (closest.diff > candidates.find((c) => c.label === closest.label)!.seconds * 0.2) {
+    const minutes = Math.max(1, Math.round(median / 60));
+    return `${minutes}m`;
+  }
+  return closest.label;
+};
+
 const medianStepSeconds = (times: UTCTimestamp[]) => {
   if (times.length < 2) {
     return 60 * 60 * 24;
@@ -260,8 +392,12 @@ const medianStepSeconds = (times: UTCTimestamp[]) => {
 
 export default function App() {
   const chartContainerRef = useRef<HTMLDivElement | null>(null);
+  const rsiChartContainerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
+  const rsiChartRef = useRef<IChartApi | null>(null);
+  const mainVisibleRangeRef = useRef<any>(null);
   const seriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
+  const rsiSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
   const indicatorSeriesRef = useRef<Record<IndicatorKey, ISeriesApi<"Line"> | null>>({
     ema9: null,
     ema21: null,
@@ -350,6 +486,7 @@ export default function App() {
   const [scanLoading, setScanLoading] = useState(false);
   const [scanError, setScanError] = useState<string | null>(null);
   const [scanRefresh, setScanRefresh] = useState(0);
+  const [resolutionLabel, setResolutionLabel] = useState<string | null>(null);
   const [scanTickersInput, setScanTickersInput] = useState(
     storedSettings?.scanTickersInput ?? DEFAULT_SCAN_TICKERS.join(", ")
   );
@@ -362,6 +499,87 @@ export default function App() {
         .filter(Boolean),
     [scanTickersInput]
   );
+
+  const findDeletionTarget = (
+    clickX: number,
+    clickY: number,
+    tolerance: number = DELETE_TOLERANCE_CLICK
+  ): DeleteTarget | null => {
+    const chart = chartRef.current;
+    const series = seriesRef.current;
+    if (!chart || !series) {
+      return null;
+    }
+
+    const distanceToSegment = (
+      px: number,
+      py: number,
+      x1: number,
+      y1: number,
+      x2: number,
+      y2: number
+    ) => {
+      const dx = x2 - x1;
+      const dy = y2 - y1;
+      if (dx === 0 && dy === 0) {
+        return Math.hypot(px - x1, py - y1);
+      }
+      const t = ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy);
+      const clamped = Math.max(0, Math.min(1, t));
+      const cx = x1 + clamped * dx;
+      const cy = y1 + clamped * dy;
+      return Math.hypot(px - cx, py - cy);
+    };
+
+    let best: DeleteTarget | null = null;
+
+    drawings.trendlines.forEach((trend, index) => {
+      const normalized = ensureDistinctTimes(trend.start, trend.end);
+      const x1 = chart.timeScale().timeToCoordinate(normalized.start.time);
+      const x2 = chart.timeScale().timeToCoordinate(normalized.end.time);
+      const y1 = series.priceToCoordinate(normalized.start.price);
+      const y2 = series.priceToCoordinate(normalized.end.price);
+      if (x1 === null || x2 === null || y1 === null || y2 === null) {
+        return;
+      }
+      const distance = distanceToSegment(clickX, clickY, x1, y1, x2, y2);
+      if (distance <= tolerance && (!best || distance < best.distance)) {
+        best = { kind: "trendline", index, distance };
+      }
+    });
+
+    drawings.horizontals.forEach((horizontal, index) => {
+      const y = series.priceToCoordinate(horizontal.price);
+      if (y === null) {
+        return;
+      }
+      const distance = Math.abs(clickY - y);
+      if (distance <= tolerance && (!best || distance < best.distance)) {
+        best = { kind: "horizontal", index, distance, price: horizontal.price };
+      }
+    });
+
+    drawings.fibs.forEach((fib, index) => {
+      const diff = fib.end.price - fib.start.price;
+      FIB_LEVELS.forEach((item) => {
+        const y = series.priceToCoordinate(fib.start.price + diff * item.level);
+        if (y === null) {
+          return;
+        }
+        const distance = Math.abs(clickY - y);
+        if (distance <= tolerance && (!best || distance < best.distance)) {
+          best = {
+            kind: "fib",
+            index,
+            distance,
+            price: fib.start.price + diff * item.level,
+          };
+        }
+      });
+    });
+
+    return best;
+  };
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -429,7 +647,98 @@ export default function App() {
     chartRef.current = chart;
     seriesRef.current = series;
 
-    const indicatorSeries: Record<IndicatorKey, ISeriesApi<"Line">> = {
+    let rsiChart: IChartApi | null = null;
+    let rsiSeries: ISeriesApi<"Line"> | null = null;
+    let syncMainToRsi: ((range: any) => void) | null = null;
+
+    if (rsiChartContainerRef.current) {
+      rsiChart = createChart(rsiChartContainerRef.current, {
+        height: 170,
+        layout: {
+          background: { type: ColorType.Solid, color: "#0B0F14" },
+          textColor: "#E6EDF3",
+          fontFamily: "IBM Plex Sans, sans-serif",
+        },
+        grid: {
+          vertLines: { color: "#1F2A3A" },
+          horzLines: { color: "#1F2A3A" },
+        },
+        crosshair: { mode: CrosshairMode.Normal },
+        rightPriceScale: { borderColor: "#1F2A3A" },
+        timeScale: { borderColor: "#1F2A3A", visible: false },
+        handleScroll: {
+          mouseWheel: false,
+          pressedMouseMove: false,
+          horzTouchDrag: false,
+          vertTouchDrag: false,
+        },
+        handleScale: {
+          mouseWheel: false,
+          pinch: false,
+          axisPressedMouseMove: false,
+        },
+      });
+
+      rsiChartRef.current = rsiChart;
+      rsiSeries = rsiChart.addLineSeries({
+        color: INDICATOR_COLORS.rsi,
+        lineWidth: 2,
+        priceLineVisible: false,
+        lastValueVisible: false,
+      });
+      rsiSeriesRef.current = rsiSeries;
+
+      rsiChart.priceScale("right").applyOptions({
+        scaleMargins: { top: 0.2, bottom: 0.2 },
+        borderColor: "#1F2A3A",
+      });
+
+      rsiLinesRef.current = [
+        rsiSeries.createPriceLine({
+          price: 70,
+          color: "#F6C453",
+          lineWidth: 1,
+          lineStyle: LineStyle.Dashed,
+          axisLabelVisible: true,
+          title: "RSI 70",
+        }),
+        rsiSeries.createPriceLine({
+          price: 30,
+          color: "#FF4D6D",
+          lineWidth: 1,
+          lineStyle: LineStyle.Dashed,
+          axisLabelVisible: true,
+          title: "RSI 30",
+        }),
+        rsiSeries.createPriceLine({
+          price: 50,
+          color: "#9FB0C3",
+          lineWidth: 1,
+          lineStyle: LineStyle.Dashed,
+          axisLabelVisible: false,
+          title: "RSI 50",
+        }),
+      ];
+
+      const syncState = { active: false };
+      syncMainToRsi = (range) => {
+        if (!range) {
+          return;
+        }
+        mainVisibleRangeRef.current = range;
+        if (syncState.active) {
+          return;
+        }
+        syncState.active = true;
+        rsiChart?.timeScale().setVisibleRange(range);
+        syncState.active = false;
+      };
+      chart.timeScale().subscribeVisibleTimeRangeChange(syncMainToRsi);
+    } else {
+      rsiLinesRef.current = [];
+    }
+
+    const indicatorSeries: Record<IndicatorKey, ISeriesApi<"Line"> | null> = {
       ema9: chart.addLineSeries({
         color: INDICATOR_COLORS.ema9,
         lineWidth: 2,
@@ -487,13 +796,7 @@ export default function App() {
         priceLineVisible: false,
         lastValueVisible: false,
       }),
-      rsi: chart.addLineSeries({
-        color: INDICATOR_COLORS.rsi,
-        lineWidth: 2,
-        priceLineVisible: false,
-        lastValueVisible: false,
-        priceScaleId: "rsi",
-      }),
+      rsi: rsiSeries,
       macd: chart.addLineSeries({
         color: INDICATOR_COLORS.macd,
         lineWidth: 2,
@@ -511,50 +814,25 @@ export default function App() {
       }),
     };
 
-    chart.priceScale("rsi").applyOptions({
-      scaleMargins: { top: 0.75, bottom: 0.05 },
-      borderColor: "#1F2A3A",
-    });
     chart.priceScale("macd").applyOptions({
       scaleMargins: { top: 0.55, bottom: 0.25 },
       borderColor: "#1F2A3A",
     });
 
-    rsiLinesRef.current = [
-      indicatorSeries.rsi.createPriceLine({
-        price: 70,
-        color: "#F6C453",
-        lineWidth: 1,
-        lineStyle: LineStyle.Dashed,
-        axisLabelVisible: true,
-        title: "RSI 70",
-      }),
-      indicatorSeries.rsi.createPriceLine({
-        price: 30,
-        color: "#FF4D6D",
-        lineWidth: 1,
-        lineStyle: LineStyle.Dashed,
-        axisLabelVisible: true,
-        title: "RSI 30",
-      }),
-      indicatorSeries.rsi.createPriceLine({
-        price: 50,
-        color: "#9FB0C3",
-        lineWidth: 1,
-        lineStyle: LineStyle.Dashed,
-        axisLabelVisible: false,
-        title: "RSI 50",
-      }),
-    ];
-
     (Object.keys(indicatorSeries) as IndicatorKey[]).forEach((key) => {
-      indicatorSeries[key].applyOptions({ visible: indicatorVisibility[key] });
+      const series = indicatorSeries[key];
+      if (series) {
+        series.applyOptions({ visible: indicatorVisibility[key] });
+      }
     });
     indicatorSeriesRef.current = indicatorSeries;
 
     const handleResize = () => {
       if (chartContainerRef.current) {
         chart.applyOptions({ width: chartContainerRef.current.clientWidth });
+      }
+      if (rsiChartContainerRef.current && rsiChart) {
+        rsiChart.applyOptions({ width: rsiChartContainerRef.current.clientWidth });
       }
     };
 
@@ -563,9 +841,15 @@ export default function App() {
 
     return () => {
       window.removeEventListener("resize", handleResize);
+      if (syncMainToRsi) {
+        chart.timeScale().unsubscribeVisibleTimeRangeChange(syncMainToRsi);
+      }
       chart.remove();
+      rsiChart?.remove();
       chartRef.current = null;
+      rsiChartRef.current = null;
       seriesRef.current = null;
+      rsiSeriesRef.current = null;
       indicatorSeriesRef.current = {
         ema9: null,
         ema21: null,
@@ -602,6 +886,49 @@ export default function App() {
       line.applyOptions({ lineVisible: rsiVisible, axisLabelVisible: rsiVisible })
     );
   }, [indicatorVisibility, mode]);
+
+  useEffect(() => {
+    if (mode !== "chart" || !indicatorVisibility.rsi) {
+      return;
+    }
+    const chart = rsiChartRef.current;
+    const container = rsiChartContainerRef.current;
+    if (chart && container) {
+      chart.applyOptions({ width: container.clientWidth });
+      const mainRange = mainVisibleRangeRef.current;
+      if (mainRange) {
+        chart.timeScale().setVisibleRange(mainRange);
+      } else {
+        chart.timeScale().fitContent();
+      }
+    }
+  }, [indicatorVisibility.rsi, mode]);
+
+  useEffect(() => {
+    if (mode !== "chart") {
+      return;
+    }
+    const chart = chartRef.current;
+    if (!chart) {
+      return;
+    }
+    const label = resolutionLabel ?? interval;
+    const intraday = label.endsWith("h") || (label.endsWith("m") && !label.endsWith("mo"));
+    chart.applyOptions({
+      timeScale: {
+        timeVisible: intraday,
+        secondsVisible: false,
+        tickMarkFormatter: (time: Time) => formatAxisTime(time, intraday),
+      },
+    });
+    rsiChartRef.current?.applyOptions({
+      timeScale: {
+        timeVisible: intraday,
+        secondsVisible: false,
+        tickMarkFormatter: (time: Time) => formatAxisTime(time, intraday),
+      },
+    });
+  }, [interval, mode, resolutionLabel]);
 
   useEffect(() => {
     if (mode !== "chart") {
@@ -650,6 +977,7 @@ export default function App() {
           times: candleTimes,
           step: medianStepSeconds(candleTimes),
         };
+        setResolutionLabel(inferResolution(candleTimes));
         seriesRef.current.setMarkers(
           data.signals
             .map((signal) => ({
@@ -693,9 +1021,9 @@ export default function App() {
           macd_signal: indicator.macd_signal,
         }));
 
-        const buildLineData = (values: { time: Time; value: number }[]) =>
+        const buildLineData = (values: { time: Time; value: number | null }[]) =>
           values
-            .filter((point) => Number.isFinite(point.value))
+            .filter((point) => typeof point.value === "number" && Number.isFinite(point.value))
             .sort((a, b) => timeToSeconds(a.time) - timeToSeconds(b.time));
 
         indicatorSeriesRef.current.ema9?.setData(
@@ -736,9 +1064,21 @@ export default function App() {
         );
 
         chartRef.current?.timeScale().fitContent();
+        const mainRange = chartRef.current?.timeScale().getVisibleRange();
+        if (mainRange && rsiChartRef.current) {
+          mainVisibleRangeRef.current = mainRange;
+          rsiChartRef.current.timeScale().setVisibleRange(mainRange);
+        } else {
+          rsiChartRef.current?.timeScale().fitContent();
+        }
       } catch (err) {
         const message = err instanceof Error ? err.message : "Unknown error";
         setError(message);
+        seriesRef.current?.setData([]);
+        rsiSeriesRef.current?.setData([]);
+        (Object.keys(indicatorSeriesRef.current) as IndicatorKey[]).forEach((key) => {
+          indicatorSeriesRef.current[key]?.setData([]);
+        });
       } finally {
         setLoading(false);
       }
@@ -1049,7 +1389,11 @@ export default function App() {
         clearHover();
         return;
       }
-      const target = findDeletionTarget(param.point.x, param.point.y);
+      const target = findDeletionTarget(
+        param.point.x,
+        param.point.y,
+        DELETE_TOLERANCE_HOVER
+      );
       if (!target) {
         clearHover();
         return;
@@ -1143,91 +1487,17 @@ export default function App() {
       return;
     }
 
-    const pixelTolerance = 10;
-
-    const distanceToSegment = (
-      px: number,
-      py: number,
-      x1: number,
-      y1: number,
-      x2: number,
-      y2: number
-    ) => {
-      const dx = x2 - x1;
-      const dy = y2 - y1;
-      if (dx === 0 && dy === 0) {
-        return Math.hypot(px - x1, py - y1);
-      }
-      const t = ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy);
-      const clamped = Math.max(0, Math.min(1, t));
-      const cx = x1 + clamped * dx;
-      const cy = y1 + clamped * dy;
-      return Math.hypot(px - cx, py - cy);
-    };
-
-    const findDeletionTarget = (clickX: number, clickY: number) => {
-
-      let best:
-        | { kind: "trendline"; index: number; distance: number }
-        | { kind: "horizontal"; index: number; distance: number; price: number }
-        | { kind: "fib"; index: number; distance: number; price: number }
-        | null = null;
-
-      drawings.trendlines.forEach((trend, index) => {
-        const normalized = ensureDistinctTimes(trend.start, trend.end);
-        const x1 = chart.timeScale().timeToCoordinate(normalized.start.time);
-        const x2 = chart.timeScale().timeToCoordinate(normalized.end.time);
-        const y1 = series.priceToCoordinate(normalized.start.price);
-        const y2 = series.priceToCoordinate(normalized.end.price);
-        if (x1 === null || x2 === null || y1 === null || y2 === null) {
-          return;
-        }
-        const distance = distanceToSegment(clickX, clickY, x1, y1, x2, y2);
-        if (distance <= pixelTolerance && (!best || distance < best.distance)) {
-          best = { kind: "trendline", index, distance };
-        }
-      });
-
-      drawings.horizontals.forEach((horizontal, index) => {
-        const y = series.priceToCoordinate(horizontal.price);
-        if (y === null) {
-          return;
-        }
-        const distance = Math.abs(clickY - y);
-        if (distance <= pixelTolerance && (!best || distance < best.distance)) {
-          best = { kind: "horizontal", index, distance, price: horizontal.price };
-        }
-      });
-
-      drawings.fibs.forEach((fib, index) => {
-        const diff = fib.end.price - fib.start.price;
-        FIB_LEVELS.forEach((item) => {
-          const y = series.priceToCoordinate(fib.start.price + diff * item.level);
-          if (y === null) {
-            return;
-          }
-          const distance = Math.abs(clickY - y);
-          if (distance <= pixelTolerance && (!best || distance < best.distance)) {
-            best = {
-              kind: "fib",
-              index,
-              distance,
-              price: fib.start.price + diff * item.level,
-            };
-          }
-        });
-      });
-
-      return best;
-    };
-
     const handleClick = (param: any) => {
       try {
         if (drawMode === "none" || drawMode === "delete") {
           if (!param.point) {
             return;
           }
-          const target = findDeletionTarget(param.point.x, param.point.y);
+          const target = findDeletionTarget(
+            param.point.x,
+            param.point.y,
+            DELETE_TOLERANCE_CLICK
+          );
           if (!target) {
             return;
           }
@@ -1321,7 +1591,7 @@ export default function App() {
 
     chart.subscribeClick(handleClick);
     return () => chart.unsubscribeClick(handleClick);
-  }, [drawMode, mode]);
+  }, [drawMode, mode, drawings]);
 
   const toggleIndicatorGroup = (keys: IndicatorKey[]) => {
     setIndicatorVisibility((prev) => {
@@ -1426,6 +1696,7 @@ export default function App() {
               <input
                 id="ticker"
                 className="input"
+                list="ticker-suggestions"
                 value={tickerInput}
                 onChange={(event) => setTickerInput(event.target.value.toUpperCase())}
                 onKeyDown={(event) => {
@@ -1434,6 +1705,11 @@ export default function App() {
                   }
                 }}
               />
+              <datalist id="ticker-suggestions">
+                {TICKER_SUGGESTIONS.map((value) => (
+                  <option key={value} value={value} />
+                ))}
+              </datalist>
               <button
                 className="button"
                 onClick={handleLoadTicker}
@@ -1561,7 +1837,19 @@ export default function App() {
 
       {mode === "chart" ? (
         <section className="chart-shell">
-          <div ref={chartContainerRef} className="chart" />
+          <div className="chart-panel">
+            <div ref={chartContainerRef} className="chart chart-primary" />
+            <div className="chart-overlay">
+              {resolutionLabel && resolutionLabel !== interval
+                ? `Resolution: ${resolutionLabel} (requested ${interval})`
+                : `Resolution: ${resolutionLabel ?? meta?.interval ?? interval}`}
+            </div>
+          </div>
+          <div
+            className={`chart-rsi-shell ${indicatorVisibility.rsi ? "" : "is-hidden"}`}
+          >
+            <div ref={rsiChartContainerRef} className="chart chart-rsi" />
+          </div>
         </section>
       ) : (
         <section className="scanner-shell">

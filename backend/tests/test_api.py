@@ -26,7 +26,7 @@ def test_analyze_response_shape(monkeypatch):
     )
 
     monkeypatch.setattr(main, "fetch_ohlcv", lambda ticker, interval: df)
-    monkeypatch.setattr(main, "add_indicators", lambda frame: df)
+    monkeypatch.setattr(main, "add_indicators", lambda frame, interval="1d": df)
 
     client = TestClient(main.app)
     response = client.get("/analyze/AAPL/1d")
