@@ -12,7 +12,7 @@ const pythonCandidates = process.platform === "win32"
       "python",
     ]
   : [
-      resolve(backendDir, ".venv", "bin", "python"),
+      resolve(backendDir, ".venv", "bin", "python"), 
       "python3",
       "python",
     ];
