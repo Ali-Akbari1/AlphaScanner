@@ -258,6 +258,43 @@ type ScanResponse = {
   results: ScanResult[];
 };
 
+type SweepEvent = {
+  ticker: string;
+  time: number;
+  ny_time: string;
+  direction: "bull" | "bear";
+  level_name: string;
+  level_price: number;
+  close: number;
+  high: number;
+  low: number;
+  sent: boolean;
+};
+
+type SweepScanResponse = {
+  meta: {
+    interval: string;
+    tickers: string[];
+    timezone: string;
+    ny_open_start: string;
+    ny_open_end: string;
+  };
+  events: SweepEvent[];
+};
+
+type SweepStatus = {
+  alerts_enabled: boolean;
+  sms_enabled: boolean;
+  sms_ready: boolean;
+  twilio_configured: boolean;
+  poll_seconds: number;
+  interval: string;
+  timezone: string;
+  ny_open_start: string;
+  ny_open_end: string;
+  tickers: string[];
+};
+
 const formatTime = (timestamp?: number | null) => {
   if (!timestamp) {
     return "-";
@@ -270,6 +307,13 @@ const formatPrice = (value?: number | null) => {
     return "-";
   }
   return value.toFixed(2);
+};
+
+const formatLocalTime = (timestamp?: number | null) => {
+  if (!timestamp) {
+    return "-";
+  }
+  return new Date(timestamp).toLocaleString();
 };
 
 const DEFAULT_INDICATOR_VISIBILITY: IndicatorVisibility = {
@@ -490,6 +534,13 @@ export default function App() {
   const [scanTickersInput, setScanTickersInput] = useState(
     storedSettings?.scanTickersInput ?? DEFAULT_SCAN_TICKERS.join(", ")
   );
+  const [sweepStatus, setSweepStatus] = useState<SweepStatus | null>(null);
+  const [sweepStatusLoading, setSweepStatusLoading] = useState(false);
+  const [sweepStatusError, setSweepStatusError] = useState<string | null>(null);
+  const [sweepRunLoading, setSweepRunLoading] = useState(false);
+  const [sweepRunError, setSweepRunError] = useState<string | null>(null);
+  const [sweepRunResult, setSweepRunResult] = useState<SweepScanResponse | null>(null);
+  const [sweepLastRun, setSweepLastRun] = useState<number | null>(null);
 
   const parsedScanTickers = useMemo(
     () =>
@@ -499,6 +550,19 @@ export default function App() {
         .filter(Boolean),
     [scanTickersInput]
   );
+  const sweepTickersLabel = useMemo(() => {
+    if (!sweepStatus?.tickers?.length) {
+      return "-";
+    }
+    const joined = sweepStatus.tickers.join(", ");
+    return joined.length > 80 ? `${joined.slice(0, 77)}...` : joined;
+  }, [sweepStatus?.tickers]);
+  const lastSweepEvent = useMemo(() => {
+    if (!sweepRunResult?.events?.length) {
+      return null;
+    }
+    return [...sweepRunResult.events].sort((a, b) => b.time - a.time)[0] ?? null;
+  }, [sweepRunResult]);
 
   const findDeletionTarget = (
     clickX: number,
@@ -1139,6 +1203,63 @@ export default function App() {
     return () => controller.abort();
   }, [mode, interval, scanRefresh]);
 
+  const parseApiError = async (response: Response) => {
+    let detail = `API error: ${response.status}`;
+    try {
+      const payload = await response.json();
+      if (payload && typeof payload.detail === "string") {
+        detail = payload.detail;
+      }
+    } catch {
+      detail = `API error: ${response.status}`;
+    }
+    return detail;
+  };
+
+  const fetchSweepStatus = async () => {
+    setSweepStatusLoading(true);
+    setSweepStatusError(null);
+
+    try {
+      const response = await fetch(`${API_BASE}/sweeps/status`);
+      if (!response.ok) {
+        throw new Error(await parseApiError(response));
+      }
+      const data = (await response.json()) as SweepStatus;
+      setSweepStatus(data);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      setSweepStatusError(message);
+    } finally {
+      setSweepStatusLoading(false);
+    }
+  };
+
+  const handleRunSweep = async () => {
+    setSweepRunLoading(true);
+    setSweepRunError(null);
+
+    try {
+      const response = await fetch(`${API_BASE}/sweeps/run?send_sms=true`);
+      if (!response.ok) {
+        throw new Error(await parseApiError(response));
+      }
+      const data = (await response.json()) as SweepScanResponse;
+      setSweepRunResult(data);
+      setSweepLastRun(Date.now());
+      fetchSweepStatus();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      setSweepRunError(message);
+    } finally {
+      setSweepRunLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchSweepStatus();
+  }, []);
+
   useEffect(() => {
     drawPointsRef.current = [];
     if (previewFrameRef.current !== null) {
@@ -1647,6 +1768,20 @@ export default function App() {
           value: scanMeta?.total ?? (parsedScanTickers.length || DEFAULT_SCAN_TICKERS.length),
         },
       ];
+  const smsStatusLabel = sweepStatus
+    ? sweepStatus.sms_ready
+      ? "SMS Ready"
+      : sweepStatus.sms_enabled
+        ? "SMS Not Ready"
+        : "SMS Disabled"
+    : "Status Unknown";
+  const smsStatusClass = sweepStatus
+    ? sweepStatus.sms_ready
+      ? "ready"
+      : sweepStatus.sms_enabled
+        ? "warn"
+        : "off"
+    : "off";
 
   return (
     <div className="app">
@@ -1833,6 +1968,83 @@ export default function App() {
           {drawHint ? ` | ${drawHint}` : null}
           {statusError ? ` | ${statusError}` : null}
         </div>
+      </section>
+
+      <section className="sms-panel">
+        <div className="sms-header">
+          <div>
+            <p className="sms-eyebrow">SMS Alerts</p>
+            <h2 className="sms-title">Liquidity Sweep Monitor</h2>
+            <p className="sms-subtitle">
+              Watches NY open for liquidity sweeps and sends alerts when configured.
+            </p>
+          </div>
+          <span className={`sms-pill ${smsStatusClass}`}>{smsStatusLabel}</span>
+        </div>
+
+        <div className="sms-grid">
+          <div className="sms-item">
+            <span className="sms-label">Monitor</span>
+            <span className="sms-value">
+              {sweepStatus?.alerts_enabled ? "Enabled" : "Disabled"}
+            </span>
+          </div>
+          <div className="sms-item">
+            <span className="sms-label">Interval</span>
+            <span className="sms-value">{sweepStatus?.interval ?? "-"}</span>
+          </div>
+          <div className="sms-item">
+            <span className="sms-label">Poll</span>
+            <span className="sms-value">
+              {sweepStatus ? `${sweepStatus.poll_seconds}s` : "-"}
+            </span>
+          </div>
+          <div className="sms-item">
+            <span className="sms-label">NY Window</span>
+            <span className="sms-value">
+              {sweepStatus
+                ? `${sweepStatus.ny_open_start}-${sweepStatus.ny_open_end} ${sweepStatus.timezone}`
+                : "-"}
+            </span>
+          </div>
+          <div className="sms-item">
+            <span className="sms-label">Tickers</span>
+            <span className="sms-value">{sweepTickersLabel}</span>
+          </div>
+          <div className="sms-item">
+            <span className="sms-label">Last Run</span>
+            <span className="sms-value">{formatLocalTime(sweepLastRun)}</span>
+          </div>
+          <div className="sms-item">
+            <span className="sms-label">Last Result</span>
+            <span className="sms-value">
+              {sweepRunResult ? `${sweepRunResult.events.length} sweeps` : "-"}
+            </span>
+          </div>
+          <div className="sms-item">
+            <span className="sms-label">Last Event</span>
+            <span className="sms-value">
+              {lastSweepEvent
+                ? `${lastSweepEvent.ticker} ${lastSweepEvent.direction.toUpperCase()} ${lastSweepEvent.level_name.replace(
+                    /_/g,
+                    " "
+                  )}`
+                : "-"}
+            </span>
+          </div>
+        </div>
+
+        <div className="sms-actions">
+          <button className="button" onClick={fetchSweepStatus} disabled={sweepStatusLoading}>
+            {sweepStatusLoading ? "Refreshing..." : "Refresh Status"}
+          </button>
+          <button className="button" onClick={handleRunSweep} disabled={sweepRunLoading}>
+            {sweepRunLoading ? "Running..." : "Run Sweep + SMS"}
+          </button>
+        </div>
+
+        {sweepStatusError ? <div className="sms-error">{sweepStatusError}</div> : null}
+        {sweepRunError ? <div className="sms-error">{sweepRunError}</div> : null}
       </section>
 
       {mode === "chart" ? (

@@ -171,6 +171,117 @@ body {
   font-family: "IBM Plex Mono", monospace;
 }
 
+.sms-panel {
+  background: var(--surface);
+  border: 1px solid var(--gridline);
+  border-radius: 18px;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.sms-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.sms-eyebrow {
+  margin: 0 0 6px;
+  font-size: 11px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--accent-cyan);
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.sms-title {
+  margin: 0;
+  font-size: 20px;
+  font-family: "Space Grotesk", sans-serif;
+}
+
+.sms-subtitle {
+  margin: 6px 0 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  max-width: 520px;
+}
+
+.sms-pill {
+  align-self: flex-start;
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-family: "IBM Plex Mono", monospace;
+  border: 1px solid var(--gridline);
+}
+
+.sms-pill.ready {
+  background: rgba(46, 234, 140, 0.12);
+  color: var(--accent-green);
+  border-color: rgba(46, 234, 140, 0.5);
+}
+
+.sms-pill.warn {
+  background: rgba(246, 196, 83, 0.12);
+  color: var(--accent-yellow);
+  border-color: rgba(246, 196, 83, 0.5);
+}
+
+.sms-pill.off {
+  background: rgba(255, 77, 109, 0.12);
+  color: var(--accent-red);
+  border-color: rgba(255, 77, 109, 0.5);
+}
+
+.sms-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.sms-item {
+  background: var(--surface-2);
+  border: 1px solid var(--gridline);
+  border-radius: 12px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 72px;
+}
+
+.sms-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: var(--text-secondary);
+}
+
+.sms-value {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.sms-actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.sms-error {
+  color: var(--accent-red);
+  font-size: 12px;
+  font-family: "IBM Plex Mono", monospace;
+}
+
 .chart-shell {
   background: var(--surface);
   border: 1px solid var(--gridline);

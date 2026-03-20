@@ -45,6 +45,7 @@ npm run dev:all
 
 ### Environment
 - Copy `frontend/.env.example` to `frontend/.env` and update `VITE_API_BASE` if needed.
+- (Optional) Copy `backend/.env.example` to `backend/.env` to enable sweep SMS alerts and background monitoring.
 
 ## API
 - `GET /analyze/{ticker}/{interval}` returns `meta`, `candles[]`, `signals[]`, and `indicators[]`.

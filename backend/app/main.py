@@ -1,9 +1,13 @@
 ﻿from __future__ import annotations
 
+import asyncio
+import logging
 import math
 import os
 import time
+from datetime import date, time as dt_time, timedelta
 from typing import List, Literal, Optional
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -12,6 +16,18 @@ import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover - optional dependency
+    load_dotenv = None
+try:
+    from twilio.rest import Client
+except Exception:  # pragma: no cover - optional dependency
+    Client = None
+
+_BASE_DIR = os.path.dirname(os.path.dirname(__file__))
+if load_dotenv is not None:
+    load_dotenv(os.path.join(_BASE_DIR, ".env"))
 
 app = FastAPI(title="AlphaScanner API", version="0.1.0")
 
@@ -29,6 +45,7 @@ app.add_middleware(
 )
 
 INTERVAL_MAP = {
+    "5m": "5m",
     "1h": "1h",
     "4h": "4h",
     "1d": "1d",
@@ -37,6 +54,7 @@ INTERVAL_MAP = {
 }
 
 PERIOD_MAP = {
+    "5m": "60d",
     "1h": "2y",
     "4h": "2y",
     "1d": "max",
@@ -45,6 +63,7 @@ PERIOD_MAP = {
 }
 
 INTERVAL_SECONDS = {
+    "5m": 5 * 60,
     "1h": 60 * 60,
     "4h": 4 * 60 * 60,
     "1d": 24 * 60 * 60,
@@ -83,6 +102,114 @@ _YF_SESSION.headers.update(
         )
     }
 )
+
+_LOGGER = logging.getLogger("alpha_scanner.sweeps")
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return default
+
+
+def _env_time(name: str, default: dt_time) -> dt_time:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        parts = [int(part) for part in raw.strip().split(":")]
+        if len(parts) != 2:
+            return default
+        return dt_time(hour=parts[0], minute=parts[1])
+    except Exception:
+        return default
+
+
+def _parse_ticker_list(raw: Optional[str]) -> List[str]:
+    if not raw:
+        return []
+    tickers: List[str] = []
+    for item in raw.split(","):
+        normalized = _normalize_fx_ticker(item)
+        if normalized:
+            tickers.append(normalized)
+    return tickers
+
+
+def _normalize_fx_ticker(raw: str) -> str:
+    cleaned = raw.strip().upper()
+    if not cleaned:
+        return ""
+    if "/" in cleaned:
+        cleaned = cleaned.replace("/", "")
+    if cleaned.endswith("=X") or "-" in cleaned:
+        return cleaned
+    if len(cleaned) == 6 and cleaned.isalpha():
+        return f"{cleaned}=X"
+    return cleaned
+
+
+def _format_price(value: float) -> str:
+    if value >= 100:
+        return f"{value:.3f}"
+    if value >= 10:
+        return f"{value:.4f}"
+    return f"{value:.5f}"
+
+
+DEFAULT_SWEEP_TICKERS = [
+    "EURUSD=X",
+    "GBPUSD=X",
+    "USDJPY=X",
+    "AUDUSD=X",
+    "USDCAD=X",
+]
+
+SWEEP_TIMEZONE = os.getenv("SWEEP_TIMEZONE", "America/New_York")
+SWEEP_INTERVAL = os.getenv("SWEEP_INTERVAL", "1h")
+if SWEEP_INTERVAL not in INTERVAL_MAP:
+    SWEEP_INTERVAL = "1h"
+
+SWEEP_ALERTS_ENABLED = _env_bool("SWEEP_ALERTS_ENABLED", False)
+SWEEP_SMS_ENABLED = _env_bool("SWEEP_SMS_ENABLED", False)
+SWEEP_POLL_SECONDS = _env_int("SWEEP_POLL_SECONDS", 60)
+_DEFAULT_SWEEP_LOOKBACK = 288 if SWEEP_INTERVAL in {"5m"} else 72
+SWEEP_LOOKBACK_BARS = _env_int("SWEEP_LOOKBACK_BARS", _DEFAULT_SWEEP_LOOKBACK)
+SWEEP_BREACH_ATR_MULT = _env_float("SWEEP_BREACH_ATR_MULT", 0.2)
+SWEEP_WICK_ATR_MULT = _env_float("SWEEP_WICK_ATR_MULT", 0.3)
+SWEEP_RECLAIM_BARS = _env_int("SWEEP_RECLAIM_BARS", 1)
+SWEEP_ALERT_TTL_SECONDS = _env_int("SWEEP_ALERT_TTL_SECONDS", 6 * 60 * 60)
+
+SWEEP_ASIA_START = _env_time("SWEEP_ASIA_START", dt_time(19, 0))
+SWEEP_ASIA_END = _env_time("SWEEP_ASIA_END", dt_time(2, 0))
+SWEEP_LONDON_START = _env_time("SWEEP_LONDON_START", dt_time(2, 0))
+SWEEP_LONDON_END = _env_time("SWEEP_LONDON_END", dt_time(8, 0))
+SWEEP_NY_OPEN_START = _env_time("SWEEP_NY_OPEN_START", dt_time(8, 0))
+SWEEP_NY_OPEN_END = _env_time("SWEEP_NY_OPEN_END", dt_time(10, 0))
+
+SWEEP_TICKERS = _parse_ticker_list(os.getenv("SWEEP_TICKERS")) or DEFAULT_SWEEP_TICKERS
+_SWEEP_ALERT_CACHE: dict[tuple[str, str, str, int], float] = {}
 
 
 def _yf_download(*args, **kwargs) -> pd.DataFrame:
@@ -168,6 +295,45 @@ class ScanResponse(BaseModel):
     results: List[ScanResult]
 
 
+class SweepEvent(BaseModel):
+    ticker: str
+    time: int
+    ny_time: str
+    direction: Literal["bull", "bear"]
+    level_name: str
+    level_price: float
+    close: float
+    high: float
+    low: float
+    sent: bool = False
+
+
+class SweepScanMeta(BaseModel):
+    interval: str
+    tickers: List[str]
+    timezone: str
+    ny_open_start: str
+    ny_open_end: str
+
+
+class SweepScanResponse(BaseModel):
+    meta: SweepScanMeta
+    events: List[SweepEvent]
+
+
+class SweepStatusResponse(BaseModel):
+    alerts_enabled: bool
+    sms_enabled: bool
+    sms_ready: bool
+    twilio_configured: bool
+    poll_seconds: int
+    interval: str
+    timezone: str
+    ny_open_start: str
+    ny_open_end: str
+    tickers: List[str]
+
+
 def fetch_ohlcv(ticker: str, interval: str) -> pd.DataFrame:
     cache_key = (ticker.upper(), interval)
     cached = _ohlcv_cache.get(cache_key)
@@ -181,7 +347,7 @@ def fetch_ohlcv(ticker: str, interval: str) -> pd.DataFrame:
     if not yf_interval:
         raise HTTPException(status_code=400, detail=f"Unsupported interval: {interval}")
 
-    if interval in {"1h", "4h"}:
+    if interval in {"5m", "1h", "4h"}:
         raw_df = fetch_intraday_ohlcv(ticker, yf_interval, INTERVAL_SECONDS[interval])
     else:
         period = PERIOD_MAP[interval]
@@ -207,7 +373,7 @@ def fetch_ohlcv(ticker: str, interval: str) -> pd.DataFrame:
         period = PERIOD_MAP[interval]
         df = normalize_ohlcv(fetch_ohlcv_history(ticker, period, yf_interval))
 
-    if df.empty and interval in {"1h", "4h"}:
+    if df.empty and interval in {"5m", "1h", "4h"}:
         for fallback in ("2y", "1y", "6mo", "3mo", "60d"):
             df = normalize_ohlcv(fetch_ohlcv_history(ticker, fallback, yf_interval))
             if not df.empty:
@@ -772,6 +938,277 @@ def build_indicators(df: pd.DataFrame) -> List[Indicator]:
     return indicators
 
 
+def _get_sweep_zone() -> ZoneInfo:
+    try:
+        return ZoneInfo(SWEEP_TIMEZONE)
+    except Exception:
+        return ZoneInfo("UTC")
+
+
+def _time_in_window(value: dt_time, start: dt_time, end: dt_time) -> bool:
+    if start <= end:
+        return start <= value < end
+    return value >= start or value < end
+
+
+def _build_session_mask(
+    local_index: pd.DatetimeIndex,
+    target_date: date,
+    start: dt_time,
+    end: dt_time,
+    include_prev_for_wrap: bool = False,
+) -> np.ndarray:
+    local_dates = local_index.date
+    local_times = local_index.time
+    if start <= end:
+        return (local_dates == target_date) & (local_times >= start) & (local_times < end)
+
+    if include_prev_for_wrap:
+        prev_date = target_date - timedelta(days=1)
+        return ((local_dates == prev_date) & (local_times >= start)) | (
+            (local_dates == target_date) & (local_times < end)
+        )
+
+    return (local_dates == target_date) & ((local_times >= start) | (local_times < end))
+
+
+def _compute_sweep_levels(df: pd.DataFrame, zone: ZoneInfo) -> List[tuple[str, float]]:
+    if df.empty:
+        return []
+
+    df = df.dropna(subset=["high", "low"]).sort_index()
+    if df.empty:
+        return []
+
+    local_index = df.index
+    if local_index.tz is None:
+        local_index = local_index.tz_localize("UTC")
+    local_index = local_index.tz_convert(zone)
+
+    current_date = local_index[-1].date()
+    prev_date = current_date - timedelta(days=1)
+    local_dates = local_index.date
+
+    levels: List[tuple[str, float]] = []
+
+    prev_mask = local_dates == prev_date
+    if prev_mask.any():
+        prev_high = float(df.loc[prev_mask, "high"].max())
+        prev_low = float(df.loc[prev_mask, "low"].min())
+        levels.append(("prev_day_high", prev_high))
+        levels.append(("prev_day_low", prev_low))
+
+    asia_mask = _build_session_mask(
+        local_index,
+        current_date,
+        SWEEP_ASIA_START,
+        SWEEP_ASIA_END,
+        include_prev_for_wrap=True,
+    )
+    if asia_mask.any():
+        asia_high = float(df.loc[asia_mask, "high"].max())
+        asia_low = float(df.loc[asia_mask, "low"].min())
+        levels.append(("asia_high", asia_high))
+        levels.append(("asia_low", asia_low))
+
+    london_mask = _build_session_mask(
+        local_index,
+        current_date,
+        SWEEP_LONDON_START,
+        SWEEP_LONDON_END,
+    )
+    if london_mask.any():
+        london_high = float(df.loc[london_mask, "high"].max())
+        london_low = float(df.loc[london_mask, "low"].min())
+        levels.append(("london_high", london_high))
+        levels.append(("london_low", london_low))
+
+    return levels
+
+
+def _reclaim_after_breach(
+    df: pd.DataFrame,
+    start_idx: int,
+    level: float,
+    direction: Literal["bull", "bear"],
+    bars: int,
+) -> bool:
+    if bars <= 0:
+        return True
+    end_idx = min(start_idx + bars, len(df) - 1)
+    window = df.iloc[start_idx : end_idx + 1]
+    if direction == "bull":
+        return bool((window["close"] > level).any())
+    return bool((window["close"] < level).any())
+
+
+def _detect_liquidity_sweeps(
+    ticker: str,
+    df: pd.DataFrame,
+    levels: List[tuple[str, float]],
+    zone: ZoneInfo,
+) -> List[SweepEvent]:
+    if df.empty or not levels:
+        return []
+
+    df = df.dropna(subset=["open", "high", "low", "close"]).sort_index()
+    if df.empty:
+        return []
+
+    df = df.tail(SWEEP_LOOKBACK_BARS)
+    if df.empty:
+        return []
+
+    atr = compute_atr(df["high"], df["low"], df["close"], length=14)
+    df = df.assign(atr=atr)
+
+    local_index = df.index
+    if local_index.tz is None:
+        local_index = local_index.tz_localize("UTC")
+    local_index = local_index.tz_convert(zone)
+    current_date = local_index[-1].date()
+
+    events: List[SweepEvent] = []
+
+    for idx, (ts, row) in enumerate(df.iterrows()):
+        local_dt = local_index[idx]
+        if local_dt.date() != current_date:
+            continue
+        if not _time_in_window(local_dt.time(), SWEEP_NY_OPEN_START, SWEEP_NY_OPEN_END):
+            continue
+
+        atr_value = row.get("atr")
+        if atr_value is None or not math.isfinite(atr_value) or atr_value <= 0:
+            continue
+
+        breach = max(SWEEP_BREACH_ATR_MULT * atr_value, 0.0)
+        wick_min = SWEEP_WICK_ATR_MULT * atr_value
+
+        for level_name, level_price in levels:
+            if row["low"] < level_price - breach:
+                wick = level_price - row["low"]
+                if wick >= wick_min and _reclaim_after_breach(df, idx, level_price, "bull", SWEEP_RECLAIM_BARS):
+                    events.append(
+                        SweepEvent(
+                            ticker=ticker,
+                            time=int(ts.timestamp()),
+                            ny_time=local_dt.strftime("%Y-%m-%d %H:%M %Z"),
+                            direction="bull",
+                            level_name=level_name,
+                            level_price=float(level_price),
+                            close=float(row["close"]),
+                            high=float(row["high"]),
+                            low=float(row["low"]),
+                        )
+                    )
+
+            if row["high"] > level_price + breach:
+                wick = row["high"] - level_price
+                if wick >= wick_min and _reclaim_after_breach(df, idx, level_price, "bear", SWEEP_RECLAIM_BARS):
+                    events.append(
+                        SweepEvent(
+                            ticker=ticker,
+                            time=int(ts.timestamp()),
+                            ny_time=local_dt.strftime("%Y-%m-%d %H:%M %Z"),
+                            direction="bear",
+                            level_name=level_name,
+                            level_price=float(level_price),
+                            close=float(row["close"]),
+                            high=float(row["high"]),
+                            low=float(row["low"]),
+                        )
+                    )
+
+    return events
+
+
+def _prune_sweep_cache(now: float) -> None:
+    if not _SWEEP_ALERT_CACHE:
+        return
+    for key, ts in list(_SWEEP_ALERT_CACHE.items()):
+        if now - ts > SWEEP_ALERT_TTL_SECONDS:
+            _SWEEP_ALERT_CACHE.pop(key, None)
+
+
+def _format_sweep_sms(event: SweepEvent) -> str:
+    direction = "Bullish" if event.direction == "bull" else "Bearish"
+    level_label = event.level_name.replace("_", " ").title()
+    return (
+        f"{direction} liquidity sweep on {event.ticker} at {event.ny_time}. "
+        f"Swept {level_label} ({_format_price(event.level_price)}). "
+        f"Close {_format_price(event.close)}."
+    )
+
+
+def _send_sweep_sms(events: List[SweepEvent]) -> List[SweepEvent]:
+    if not events:
+        return events
+    if not SWEEP_SMS_ENABLED:
+        return events
+    if Client is None:
+        _LOGGER.warning("Twilio client not available; install the twilio package to enable SMS.")
+        return events
+
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    from_number = os.getenv("TWILIO_FROM_NUMBER")
+    to_numbers = [num.strip() for num in (os.getenv("TWILIO_TO_NUMBER") or "").split(",") if num.strip()]
+
+    if not account_sid or not auth_token or not from_number or not to_numbers:
+        _LOGGER.warning("Twilio credentials or numbers missing; SMS alerts are disabled.")
+        return events
+
+    client = Client(account_sid, auth_token)
+    now = time.time()
+    _prune_sweep_cache(now)
+
+    for event in events:
+        key = (event.ticker, event.level_name, event.direction, event.time)
+        if key in _SWEEP_ALERT_CACHE and now - _SWEEP_ALERT_CACHE[key] < SWEEP_ALERT_TTL_SECONDS:
+            continue
+
+        body = _format_sweep_sms(event)
+        sent_any = False
+        for to_number in to_numbers:
+            try:
+                client.messages.create(body=body, from_=from_number, to=to_number)
+                sent_any = True
+            except Exception as exc:  # pragma: no cover - provider errors
+                _LOGGER.warning("Failed to send sweep SMS to %s: %s", to_number, exc)
+
+        if sent_any:
+            event.sent = True
+            _SWEEP_ALERT_CACHE[key] = now
+
+    return events
+
+
+def run_sweep_scan(
+    tickers: List[str],
+    interval: str,
+    send_sms: bool = False,
+) -> List[SweepEvent]:
+    zone = _get_sweep_zone()
+    events: List[SweepEvent] = []
+
+    for ticker in tickers:
+        try:
+            df = fetch_ohlcv(ticker, interval)
+        except HTTPException as exc:
+            _LOGGER.warning("Sweep scan skipped %s: %s", ticker, exc.detail)
+            continue
+        except Exception as exc:  # pragma: no cover - safety net
+            _LOGGER.warning("Sweep scan failed %s: %s", ticker, exc)
+            continue
+
+        levels = _compute_sweep_levels(df, zone)
+        events.extend(_detect_liquidity_sweeps(ticker, df, levels, zone))
+
+    if send_sms:
+        events = _send_sweep_sms(events)
+    return events
+
+
 def summarize_ticker(ticker: str, interval: str) -> ScanResult:
     try:
         df = fetch_ohlcv(ticker, interval)
@@ -941,6 +1378,69 @@ async def scan(
 
     meta = ScanMeta(interval=interval, tickers=deduped, total=len(deduped))
     return ScanResponse(meta=meta, results=results)
+
+
+@app.get("/sweeps/run", response_model=SweepScanResponse)
+def run_sweeps(
+    interval: str = Query(default=SWEEP_INTERVAL, description="Interval to scan"),
+    tickers: Optional[str] = Query(default=None, description="Comma-separated tickers"),
+    send_sms: bool = Query(default=False, description="Send SMS for new sweeps"),
+) -> SweepScanResponse:
+    if interval not in INTERVAL_MAP:
+        raise HTTPException(status_code=400, detail=f"Unsupported interval: {interval}")
+
+    parsed = _parse_ticker_list(tickers) if tickers else []
+    use_tickers = parsed or SWEEP_TICKERS
+
+    events = run_sweep_scan(use_tickers, interval, send_sms=send_sms)
+    meta = SweepScanMeta(
+        interval=interval,
+        tickers=use_tickers,
+        timezone=SWEEP_TIMEZONE,
+        ny_open_start=SWEEP_NY_OPEN_START.strftime("%H:%M"),
+        ny_open_end=SWEEP_NY_OPEN_END.strftime("%H:%M"),
+    )
+    return SweepScanResponse(meta=meta, events=events)
+
+
+@app.get("/sweeps/status", response_model=SweepStatusResponse)
+def sweeps_status() -> SweepStatusResponse:
+    twilio_configured = bool(
+        os.getenv("TWILIO_ACCOUNT_SID")
+        and os.getenv("TWILIO_AUTH_TOKEN")
+        and os.getenv("TWILIO_FROM_NUMBER")
+        and os.getenv("TWILIO_TO_NUMBER")
+    )
+    sms_ready = SWEEP_SMS_ENABLED and twilio_configured and Client is not None
+
+    return SweepStatusResponse(
+        alerts_enabled=SWEEP_ALERTS_ENABLED,
+        sms_enabled=SWEEP_SMS_ENABLED,
+        sms_ready=sms_ready,
+        twilio_configured=twilio_configured,
+        poll_seconds=SWEEP_POLL_SECONDS,
+        interval=SWEEP_INTERVAL,
+        timezone=SWEEP_TIMEZONE,
+        ny_open_start=SWEEP_NY_OPEN_START.strftime("%H:%M"),
+        ny_open_end=SWEEP_NY_OPEN_END.strftime("%H:%M"),
+        tickers=SWEEP_TICKERS,
+    )
+
+
+async def _sweep_monitor_loop() -> None:
+    while True:
+        try:
+            await asyncio.to_thread(run_sweep_scan, SWEEP_TICKERS, SWEEP_INTERVAL, True)
+        except Exception as exc:  # pragma: no cover - safety net
+            _LOGGER.warning("Sweep monitor error: %s", exc)
+        await asyncio.sleep(SWEEP_POLL_SECONDS)
+
+
+@app.on_event("startup")
+async def start_sweep_monitor() -> None:
+    if not SWEEP_ALERTS_ENABLED:
+        return
+    asyncio.create_task(_sweep_monitor_loop())
 
 
 @app.get("/health")
