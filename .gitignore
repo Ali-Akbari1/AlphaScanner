@@ -16,6 +16,10 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 
+# Dukascopy cache
+backend/data/dukascopy/
+backend/backend/data/dukascopy/
+
 # Logs
 *.log
 

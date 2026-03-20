@@ -295,6 +295,139 @@ type SweepStatus = {
   tickers: string[];
 };
 
+type BacktestTrade = {
+  ticker: string;
+  session: "london" | "newyork";
+  direction: "long" | "short";
+  level_name: string;
+  sweep_time: number;
+  fvg_time?: number | null;
+  entry_time: number;
+  entry_price: number;
+  stop_price: number;
+  target_price: number;
+  exit_time: number;
+  exit_price: number;
+  result: "win" | "loss" | "breakeven";
+  r_multiple: number;
+  pnl: number;
+};
+
+type BacktestSummary = {
+  starting_balance: number;
+  ending_balance: number;
+  return_pct: number;
+  total_trades: number;
+  wins: number;
+  losses: number;
+  breakeven: number;
+  win_rate: number;
+  profit_factor: number | null;
+  max_drawdown: number;
+};
+
+type EquityPoint = {
+  time: number;
+  equity: number;
+};
+
+type SessionBreakdown = {
+  session: "london" | "newyork";
+  total_trades: number;
+  wins: number;
+  losses: number;
+  breakeven: number;
+  win_rate: number;
+  profit_factor: number | null;
+  return_pct: number;
+};
+
+type BacktestResponse = {
+  meta: {
+    tickers: string[];
+    interval: string;
+    session: string;
+    timezone: string;
+    ny_open_start: string;
+    ny_open_end: string;
+    london_start: string;
+    london_end: string;
+    data_ranges: Record<string, { start: number; end: number }>;
+    notes: string;
+  };
+  summary: BacktestSummary;
+  session_breakdown: SessionBreakdown[];
+  equity_curve: EquityPoint[];
+  trades: BacktestTrade[];
+};
+
+type GridSearchResult = {
+  params: Record<string, number>;
+  summary: BacktestSummary;
+  score: number;
+};
+
+type GridSearchResponse = {
+  meta: {
+    tickers: string[];
+    interval: string;
+    session: string;
+    timezone: string;
+    combinations_tested: number;
+    max_combinations: number;
+    sort_by: string;
+    data_ranges: Record<string, { start: number; end: number }>;
+    notes: string;
+  };
+  results: GridSearchResult[];
+};
+
+type DukascopyProgress = {
+  source: string;
+  processed: number;
+  total: number;
+  cached: number;
+  downloaded: number;
+  missing: number;
+  retry_attempts: number;
+  skipped: number;
+  speed: number;
+  eta_seconds: number;
+  percent: number;
+  updated_at: number;
+};
+
+type DukascopyProgressResponse = {
+  paused: boolean;
+  canceled: boolean;
+  sources: DukascopyProgress[];
+};
+
+type BatchBacktestResponse = {
+  meta: {
+    tickers: string[];
+    interval: string;
+    session: string;
+    timezone: string;
+    start_year: number;
+    end_year: number;
+    notes: string;
+  };
+  results: {
+    year: number;
+    summary: BacktestSummary;
+    total_trades: number;
+  }[];
+};
+
+type BatchProgressResponse = {
+  status: "idle" | "running" | "done";
+  processed: number;
+  total: number;
+  current_year: number | null;
+  updated_at: number;
+};
+
 const formatTime = (timestamp?: number | null) => {
   if (!timestamp) {
     return "-";
@@ -315,6 +448,31 @@ const formatLocalTime = (timestamp?: number | null) => {
   }
   return new Date(timestamp).toLocaleString();
 };
+
+const formatEta = (seconds?: number | null) => {
+  if (!seconds || !Number.isFinite(seconds) || seconds <= 0) {
+    return "-";
+  }
+  const total = Math.max(0, Math.round(seconds));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m ${secs}s`;
+  }
+  return `${secs}s`;
+};
+
+const formatDate = (value: Date) => value.toISOString().slice(0, 10);
+
+const parseTickers = (value: string) =>
+  value
+    .split(/[\s,]+/)
+    .map((ticker) => ticker.trim().toUpperCase())
+    .filter(Boolean);
 
 const DEFAULT_INDICATOR_VISIBILITY: IndicatorVisibility = {
   ema9: true,
@@ -541,6 +699,22 @@ export default function App() {
   const [sweepRunError, setSweepRunError] = useState<string | null>(null);
   const [sweepRunResult, setSweepRunResult] = useState<SweepScanResponse | null>(null);
   const [sweepLastRun, setSweepLastRun] = useState<number | null>(null);
+  const [backtestLoading, setBacktestLoading] = useState(false);
+  const [backtestError, setBacktestError] = useState<string | null>(null);
+  const [backtestResult, setBacktestResult] = useState<BacktestResponse | null>(null);
+  const [csvLoading, setCsvLoading] = useState(false);
+  const [gridLoading, setGridLoading] = useState(false);
+  const [gridError, setGridError] = useState<string | null>(null);
+  const [gridResult, setGridResult] = useState<GridSearchResponse | null>(null);
+  const [batchLoading, setBatchLoading] = useState(false);
+  const [batchError, setBatchError] = useState<string | null>(null);
+  const [batchResult, setBatchResult] = useState<BatchBacktestResponse | null>(null);
+  const [dukasProgress, setDukasProgress] = useState<DukascopyProgress[]>([]);
+  const [dukasLoading, setDukasLoading] = useState(false);
+  const [dukasPaused, setDukasPaused] = useState(false);
+  const [dukasCanceled, setDukasCanceled] = useState(false);
+  const [batchProgress, setBatchProgress] = useState<BatchProgressResponse | null>(null);
+  const [batchCanceling, setBatchCanceling] = useState(false);
 
   const parsedScanTickers = useMemo(
     () =>
@@ -563,6 +737,51 @@ export default function App() {
     }
     return [...sweepRunResult.events].sort((a, b) => b.time - a.time)[0] ?? null;
   }, [sweepRunResult]);
+  const [backtestTickersInput, setBacktestTickersInput] = useState(
+    "EURUSD, GBPUSD, XAUUSD"
+  );
+  const [backtestInterval, setBacktestInterval] = useState<"1m" | "5m">("5m");
+  const [backtestSession, setBacktestSession] = useState<"london" | "newyork" | "both">(
+    "both"
+  );
+  const [backtestStart, setBacktestStart] = useState(() => {
+    const end = new Date();
+    const start = new Date(end.getTime() - 1000 * 60 * 60 * 24 * 60);
+    return formatDate(start);
+  });
+  const [backtestEnd, setBacktestEnd] = useState(() => formatDate(new Date()));
+
+  const backtestTickers = useMemo(
+    () => parseTickers(backtestTickersInput),
+    [backtestTickersInput]
+  );
+  const backtestPayload = useMemo(
+    () => ({
+      tickers: backtestTickers,
+      interval: backtestInterval,
+      session: backtestSession,
+      start: backtestStart,
+      end: backtestEnd,
+      starting_balance: 10000,
+      risk_per_trade: 0.005,
+      max_trades_per_day: 2,
+      sweep_atr_mult: 0.6,
+      return_within_bars: 20,
+      fvg_min_atr_mult: 0,
+      fvg_retrace_window: 12,
+      stop_atr_mult: 1.2,
+      target_rr: 2,
+    }),
+    [backtestTickers, backtestInterval, backtestSession, backtestStart, backtestEnd]
+  );
+  const batchPayload = useMemo(
+    () => ({
+      base: backtestPayload,
+      start_year: backtestStart ? Number(backtestStart.slice(0, 4)) : undefined,
+      end_year: backtestEnd ? Number(backtestEnd.slice(0, 4)) : undefined,
+    }),
+    [backtestPayload, backtestStart, backtestEnd]
+  );
 
   const findDeletionTarget = (
     clickX: number,
@@ -1256,6 +1475,195 @@ export default function App() {
     }
   };
 
+  const handleRunBacktest = async () => {
+    setBacktestLoading(true);
+    setBacktestError(null);
+
+    try {
+      if (backtestPayload.tickers.length === 0) {
+        throw new Error("Add at least one ticker to run a backtest.");
+      }
+      const response = await fetch(`${API_BASE}/backtest/sweep`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(backtestPayload),
+      });
+      if (!response.ok) {
+        throw new Error(await parseApiError(response));
+      }
+      const data = (await response.json()) as BacktestResponse;
+      setBacktestResult(data);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      setBacktestError(message);
+    } finally {
+      setBacktestLoading(false);
+    }
+  };
+
+  const handleDownloadCsv = async () => {
+    setCsvLoading(true);
+    try {
+      if (backtestPayload.tickers.length === 0) {
+        throw new Error("Add at least one ticker to export CSV.");
+      }
+      const response = await fetch(`${API_BASE}/backtest/sweep/csv`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(backtestPayload),
+      });
+      if (!response.ok) {
+        throw new Error(await parseApiError(response));
+      }
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = "backtest_trades.csv";
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      setBacktestError(message);
+    } finally {
+      setCsvLoading(false);
+    }
+  };
+
+  const handleGridSearch = async () => {
+    setGridLoading(true);
+    setGridError(null);
+
+    if (backtestPayload.tickers.length === 0) {
+      setGridError("Add at least one ticker to run grid search.");
+      setGridLoading(false);
+      return;
+    }
+    const gridBody = {
+      base: backtestPayload,
+      sweep_atr_mults: [0.4, 0.5, 0.6],
+      return_within_bars: [10, 20, 30],
+      fvg_min_atr_mults: [0, 0.1],
+      fvg_retrace_windows: [8, 12, 16],
+      stop_atr_mults: [1.0, 1.2],
+      target_rrs: [1.5, 2.0],
+      max_combinations: 120,
+      top_n: 8,
+      sort_by: "score",
+    };
+
+    try {
+      const response = await fetch(`${API_BASE}/backtest/sweep/grid`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(gridBody),
+      });
+      if (!response.ok) {
+        throw new Error(await parseApiError(response));
+      }
+      const data = (await response.json()) as GridSearchResponse;
+      setGridResult(data);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      setGridError(message);
+    } finally {
+      setGridLoading(false);
+    }
+  };
+
+  const handleBatchBacktest = async () => {
+    setBatchLoading(true);
+    setBatchError(null);
+
+    if (backtestPayload.tickers.length === 0) {
+      setBatchError("Add at least one ticker to run batch backtest.");
+      setBatchLoading(false);
+      return;
+    }
+
+    try {
+      const response = await fetch(`${API_BASE}/backtest/sweep/batch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(batchPayload),
+      });
+      if (!response.ok) {
+        throw new Error(await parseApiError(response));
+      }
+      const data = (await response.json()) as BatchBacktestResponse;
+      setBatchResult(data);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      setBatchError(message);
+    } finally {
+      setBatchLoading(false);
+    }
+  };
+
+  const fetchDukascopyProgress = async () => {
+    setDukasLoading(true);
+    try {
+      const response = await fetch(`${API_BASE}/dukascopy/progress`);
+      if (!response.ok) {
+        throw new Error(await parseApiError(response));
+      }
+      const data = (await response.json()) as DukascopyProgressResponse;
+      setDukasProgress(data.sources ?? []);
+      setDukasPaused(Boolean(data.paused));
+      setDukasCanceled(Boolean(data.canceled));
+    } catch {
+      setDukasProgress([]);
+    } finally {
+      setDukasLoading(false);
+    }
+  };
+
+  const sendDukascopyControl = async (action: "pause" | "resume" | "cancel") => {
+    try {
+      await fetch(`${API_BASE}/dukascopy/${action}`, { method: "POST" });
+      fetchDukascopyProgress();
+    } catch {
+      // ignore UI control errors
+    }
+  };
+
+  const cancelBatchBacktest = async () => {
+    setBatchCanceling(true);
+    try {
+      await fetch(`${API_BASE}/backtest/sweep/batch/cancel`, { method: "POST" });
+      fetchBatchProgress();
+    } catch {
+      // ignore
+    } finally {
+      setBatchCanceling(false);
+    }
+  };
+
+  const fetchBatchProgress = async () => {
+    try {
+      const response = await fetch(`${API_BASE}/backtest/sweep/batch/progress`);
+      if (!response.ok) {
+        return;
+      }
+      const data = (await response.json()) as BatchProgressResponse;
+      setBatchProgress(data);
+    } catch {
+      setBatchProgress(null);
+    }
+  };
+
+  useEffect(() => {
+    fetchDukascopyProgress();
+    fetchBatchProgress();
+    const intervalId = window.setInterval(() => {
+      fetchDukascopyProgress();
+      fetchBatchProgress();
+    }, 4000);
+    return () => window.clearInterval(intervalId);
+  }, []);
+
   useEffect(() => {
     fetchSweepStatus();
   }, []);
@@ -1782,6 +2190,25 @@ export default function App() {
         ? "warn"
         : "off"
     : "off";
+  const equityPath = useMemo(() => {
+    const points = backtestResult?.equity_curve ?? [];
+    if (points.length < 2) {
+      return "";
+    }
+    const values = points.map((point) => point.equity);
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const range = max - min || 1;
+    const width = 520;
+    const height = 160;
+    return points
+      .map((point, idx) => {
+        const x = (idx / (points.length - 1)) * width;
+        const y = height - ((point.equity - min) / range) * height;
+        return `${idx === 0 ? "M" : "L"}${x.toFixed(2)} ${y.toFixed(2)}`;
+      })
+      .join(" ");
+  }, [backtestResult]);
 
   return (
     <div className="app">
@@ -2045,6 +2472,310 @@ export default function App() {
 
         {sweepStatusError ? <div className="sms-error">{sweepStatusError}</div> : null}
         {sweepRunError ? <div className="sms-error">{sweepRunError}</div> : null}
+      </section>
+
+      <section className="backtest-panel">
+        <div className="backtest-header">
+          <div>
+            <p className="backtest-eyebrow">Backtest Lab</p>
+            <h2 className="backtest-title">Sweep + FVG Strategy</h2>
+            <p className="backtest-subtitle">
+              Runs the liquidity sweep + FVG retrace rules across London and NY sessions.
+            </p>
+          </div>
+          <div className="backtest-actions">
+            <button className="button" onClick={handleRunBacktest} disabled={backtestLoading}>
+              {backtestLoading ? "Running..." : "Run Backtest"}
+            </button>
+            <button className="button" onClick={handleDownloadCsv} disabled={csvLoading}>
+              {csvLoading ? "Exporting..." : "Export CSV"}
+            </button>
+            <button className="button" onClick={handleGridSearch} disabled={gridLoading}>
+              {gridLoading ? "Searching..." : "Run Grid Search"}
+            </button>
+            <button className="button" onClick={handleBatchBacktest} disabled={batchLoading}>
+              {batchLoading ? "Batching..." : "Run Yearly Batch"}
+            </button>
+          </div>
+        </div>
+
+        <div className="backtest-form">
+          <div className="backtest-field">
+            <span className="backtest-field-label">Tickers</span>
+            <input
+              className="input"
+              value={backtestTickersInput}
+              onChange={(event) => setBacktestTickersInput(event.target.value)}
+              placeholder="EURUSD, GBPUSD, XAUUSD"
+            />
+          </div>
+          <div className="backtest-field">
+            <span className="backtest-field-label">Interval</span>
+            <select
+              className="input"
+              value={backtestInterval}
+              onChange={(event) => setBacktestInterval(event.target.value as "1m" | "5m")}
+            >
+              <option value="5m">5m</option>
+              <option value="1m">1m</option>
+            </select>
+          </div>
+          <div className="backtest-field">
+            <span className="backtest-field-label">Session</span>
+            <select
+              className="input"
+              value={backtestSession}
+              onChange={(event) =>
+                setBacktestSession(event.target.value as "london" | "newyork" | "both")
+              }
+            >
+              <option value="both">Both</option>
+              <option value="london">London</option>
+              <option value="newyork">New York</option>
+            </select>
+          </div>
+          <div className="backtest-field">
+            <span className="backtest-field-label">Start</span>
+            <input
+              className="input"
+              type="date"
+              value={backtestStart}
+              onChange={(event) => setBacktestStart(event.target.value)}
+            />
+          </div>
+          <div className="backtest-field">
+            <span className="backtest-field-label">End</span>
+            <input
+              className="input"
+              type="date"
+              value={backtestEnd}
+              onChange={(event) => setBacktestEnd(event.target.value)}
+            />
+          </div>
+        </div>
+
+        <div className="backtest-meta">
+          <div className="backtest-chip">
+            Tickers: {backtestTickers.length ? backtestTickers.join(", ") : "-"}
+          </div>
+          <div className="backtest-chip">Interval: {backtestInterval}</div>
+          <div className="backtest-chip">Session: {backtestSession}</div>
+          <div className="backtest-chip">
+            Window: {backtestStart} → {backtestEnd}
+          </div>
+        </div>
+
+        <div className="backtest-grid">
+          <div className="backtest-card">
+            <span className="backtest-label">Return</span>
+            <span className="backtest-value">
+              {backtestResult ? `${backtestResult.summary.return_pct.toFixed(2)}%` : "-"}
+            </span>
+          </div>
+          <div className="backtest-card">
+            <span className="backtest-label">Trades</span>
+            <span className="backtest-value">
+              {backtestResult ? backtestResult.summary.total_trades : "-"}
+            </span>
+          </div>
+          <div className="backtest-card">
+            <span className="backtest-label">Win Rate</span>
+            <span className="backtest-value">
+              {backtestResult ? `${(backtestResult.summary.win_rate * 100).toFixed(1)}%` : "-"}
+            </span>
+          </div>
+          <div className="backtest-card">
+            <span className="backtest-label">Profit Factor</span>
+            <span className="backtest-value">
+              {backtestResult && backtestResult.summary.profit_factor !== null
+                ? backtestResult.summary.profit_factor.toFixed(2)
+                : "-"}
+            </span>
+          </div>
+          <div className="backtest-card">
+            <span className="backtest-label">Max Drawdown</span>
+            <span className="backtest-value">
+              {backtestResult ? `${(backtestResult.summary.max_drawdown * 100).toFixed(2)}%` : "-"}
+            </span>
+          </div>
+        </div>
+
+        <div className="backtest-chart">
+          {equityPath ? (
+            <svg viewBox="0 0 520 160" className="equity-chart" role="img">
+              <path d={equityPath} className="equity-line" />
+            </svg>
+          ) : (
+            <div className="backtest-placeholder">Run a backtest to see the equity curve.</div>
+          )}
+        </div>
+
+        <div className="dukascopy-progress">
+          <div className="progress-header">
+            <span>Dukascopy Download Progress</span>
+            <div className="progress-actions">
+              <button className="button" onClick={fetchDukascopyProgress} disabled={dukasLoading}>
+                {dukasLoading ? "Refreshing..." : "Refresh"}
+              </button>
+              <button
+                className="button"
+                onClick={() => sendDukascopyControl(dukasPaused ? "resume" : "pause")}
+              >
+                {dukasPaused ? "Resume" : "Pause"}
+              </button>
+              <button className="button" onClick={() => sendDukascopyControl("cancel")}>
+                Cancel
+              </button>
+            </div>
+          </div>
+          {dukasProgress.length === 0 ? (
+            <div className="backtest-placeholder">No active Dukascopy downloads yet.</div>
+          ) : (
+            <div className="progress-list progress-list-wide">
+              {dukasProgress.map((item) => (
+                <div key={item.source} className="progress-row">
+                  <div className="progress-label">{item.source}</div>
+                  <div className="progress-bar">
+                    <div
+                      className="progress-fill"
+                      style={{ width: `${Math.min(item.percent, 100).toFixed(1)}%` }}
+                    />
+                  </div>
+                  <div className="progress-meta">
+                    {item.percent.toFixed(1)}% · {item.processed}/{item.total} hours
+                  </div>
+                  <div className="progress-meta">
+                    Speed {item.speed.toFixed(2)} h/s · Retry {item.retry_attempts} · ETA{" "}
+                    {formatEta(item.eta_seconds)}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {batchProgress ? (
+          <div className="batch-progress">
+            <div className="progress-header">
+              <span>Batch Backtest Progress</span>
+              <div className="progress-actions">
+                <span className="progress-state">{batchProgress.status}</span>
+                <button
+                  className="button"
+                  onClick={cancelBatchBacktest}
+                  disabled={batchCanceling}
+                >
+                  {batchCanceling ? "Canceling..." : "Cancel"}
+                </button>
+              </div>
+            </div>
+            <div className="progress-row">
+              <div className="progress-label">
+                {batchProgress.current_year
+                  ? `Year ${batchProgress.current_year}`
+                  : "Waiting"}
+              </div>
+              <div className="progress-bar">
+                <div
+                  className="progress-fill"
+                  style={{
+                    width:
+                      batchProgress.total > 0
+                        ? `${(batchProgress.processed / batchProgress.total) * 100}%`
+                        : "0%",
+                  }}
+                />
+              </div>
+              <div className="progress-meta">
+                {batchProgress.processed}/{batchProgress.total} years
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        <div className="backtest-sessions">
+          {(backtestResult?.session_breakdown ?? []).map((session) => (
+            <div className="session-card" key={session.session}>
+              <div className="session-title">{session.session.toUpperCase()}</div>
+              <div className="session-row">
+                <span>Trades</span>
+                <span>{session.total_trades}</span>
+              </div>
+              <div className="session-row">
+                <span>Win Rate</span>
+                <span>{(session.win_rate * 100).toFixed(1)}%</span>
+              </div>
+              <div className="session-row">
+                <span>Profit Factor</span>
+                <span>{session.profit_factor ? session.profit_factor.toFixed(2) : "-"}</span>
+              </div>
+              <div className="session-row">
+                <span>Return</span>
+                <span>{session.return_pct.toFixed(2)}%</span>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {gridResult ? (
+          <div className="grid-results">
+            <div className="grid-header">
+              Top Grid Results (tested {gridResult.meta.combinations_tested})
+            </div>
+            <div className="grid-table">
+              {gridResult.results.map((result, idx) => (
+                <div className="grid-row" key={`${result.score}-${idx}`}>
+                  <span className="grid-rank">#{idx + 1}</span>
+                  <span className="grid-metric">
+                    Return {result.summary.return_pct.toFixed(2)}%
+                  </span>
+                  <span className="grid-metric">
+                    PF {result.summary.profit_factor ? result.summary.profit_factor.toFixed(2) : "-"}
+                  </span>
+                  <span className="grid-metric">
+                    DD {(result.summary.max_drawdown * 100).toFixed(2)}%
+                  </span>
+                  <span className="grid-params">
+                    sweep {result.params.sweep_atr_mult} · return {result.params.return_within_bars} · fvg{" "}
+                    {result.params.fvg_min_atr_mult} · retrace {result.params.fvg_retrace_window} · stop{" "}
+                    {result.params.stop_atr_mult} · RR {result.params.target_rr}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
+
+        {batchResult ? (
+          <div className="grid-results">
+            <div className="grid-header">
+              Yearly Batch Results ({batchResult.meta.start_year}–{batchResult.meta.end_year})
+            </div>
+            <div className="grid-table">
+              {batchResult.results.map((result) => (
+                <div className="grid-row" key={result.year}>
+                  <span className="grid-rank">{result.year}</span>
+                  <span className="grid-metric">
+                    Return {result.summary.return_pct.toFixed(2)}%
+                  </span>
+                  <span className="grid-metric">
+                    PF {result.summary.profit_factor ? result.summary.profit_factor.toFixed(2) : "-"}
+                  </span>
+                  <span className="grid-metric">
+                    DD {(result.summary.max_drawdown * 100).toFixed(2)}%
+                  </span>
+                  <span className="grid-params">
+                    Trades {result.total_trades} · Win {(result.summary.win_rate * 100).toFixed(1)}%
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
+
+        {backtestError ? <div className="backtest-error">{backtestError}</div> : null}
+        {gridError ? <div className="backtest-error">{gridError}</div> : null}
+        {batchError ? <div className="backtest-error">{batchError}</div> : null}
       </section>
 
       {mode === "chart" ? (

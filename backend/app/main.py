@@ -1,20 +1,26 @@
 ﻿from __future__ import annotations
 
 import asyncio
+import csv
+import io
+import itertools
 import logging
+import lzma
 import math
 import os
 import time
-from datetime import date, time as dt_time, timedelta
-from typing import List, Literal, Optional
+from datetime import date, datetime, time as dt_time, timedelta, timezone
+from typing import Dict, List, Literal, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 try:
     from dotenv import load_dotenv
@@ -45,6 +51,7 @@ app.add_middleware(
 )
 
 INTERVAL_MAP = {
+    "1m": "1m",
     "5m": "5m",
     "1h": "1h",
     "4h": "4h",
@@ -54,6 +61,7 @@ INTERVAL_MAP = {
 }
 
 PERIOD_MAP = {
+    "1m": "7d",
     "5m": "60d",
     "1h": "2y",
     "4h": "2y",
@@ -63,6 +71,7 @@ PERIOD_MAP = {
 }
 
 INTERVAL_SECONDS = {
+    "1m": 60,
     "5m": 5 * 60,
     "1h": 60 * 60,
     "4h": 4 * 60 * 60,
@@ -72,6 +81,7 @@ INTERVAL_SECONDS = {
 }
 
 INTRADAY_PERIODS = ["2y", "1y", "6mo", "3mo", "60d", "30d", "14d", "7d"]
+INTRADAY_PERIODS_1M = ["7d", "5d", "1d"]
 
 DEFAULT_TICKERS = [
     "BTC-USD",
@@ -103,7 +113,7 @@ _YF_SESSION.headers.update(
     }
 )
 
-_LOGGER = logging.getLogger("alpha_scanner.sweeps")
+_LOGGER = logging.getLogger("uvicorn.error")
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -178,6 +188,310 @@ def _format_price(value: float) -> str:
     return f"{value:.5f}"
 
 
+def _dukascopy_instrument(ticker: str) -> str:
+    cleaned = ticker.strip().upper()
+    if not cleaned:
+        return ""
+    cleaned = cleaned.replace("=X", "")
+    cleaned = cleaned.replace("/", "")
+    cleaned = cleaned.replace("-", "")
+    return cleaned
+
+
+def _dukascopy_price_scale(instrument: str) -> int:
+    override = os.getenv(f"DUKASCOPY_PRICE_SCALE_{instrument}")
+    if override:
+        try:
+            return int(override)
+        except ValueError:
+            pass
+    if instrument.startswith(("XAU", "XAG", "XPT", "XPD")):
+        return 1000
+    if instrument.endswith(("JPY", "RUB")):
+        return 1000
+    return 100000
+
+
+def _dukascopy_hour_url(instrument: str, dt: datetime) -> str:
+    month = dt.month - 1
+    return f"{DUKASCOPY_BASE_URL}/{instrument}/{dt.year}/{month:02d}/{dt.day:02d}/{dt.hour:02d}h_ticks.bi5"
+
+
+def _dukascopy_cache_path(instrument: str, dt: datetime) -> str:
+    month = dt.month - 1
+    return os.path.join(
+        DUKASCOPY_CACHE_DIR,
+        instrument,
+        f"{dt.year}",
+        f"{month:02d}",
+        f"{dt.day:02d}",
+        f"{dt.hour:02d}h_ticks.bi5",
+    )
+
+
+def _dukascopy_skip_hour(dt: datetime) -> bool:
+    if not DUKASCOPY_SKIP_WEEKENDS:
+        return False
+    return dt.weekday() >= 5
+
+
+def _dukascopy_wait_if_paused() -> bool:
+    while _DUKASCOPY_CONTROL["pause"] and not _DUKASCOPY_CONTROL["cancel"]:
+        time.sleep(0.5)
+    return _DUKASCOPY_CONTROL["cancel"]
+
+
+def _dukascopy_load_hour(instrument: str, dt: datetime) -> Tuple[Optional[bytes], bool]:
+    cache_path = _dukascopy_cache_path(instrument, dt)
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "rb") as handle:
+                return handle.read(), True
+        except OSError:
+            return None, False
+
+    url = _dukascopy_hour_url(instrument, dt)
+    for _ in range(max(DUKASCOPY_RETRY_MAX, 1)):
+        try:
+            response = requests.get(
+                url,
+                headers=_DUKASCOPY_SESSION.headers,
+                timeout=DUKASCOPY_TIMEOUT_SECONDS,
+            )
+            if response.status_code != 200:
+                continue
+            payload = response.content
+            break
+        except Exception:
+            continue
+    else:
+        return None, False
+
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    try:
+        with open(cache_path, "wb") as handle:
+            handle.write(payload)
+    except OSError:
+        pass
+    return payload, False
+
+
+def _dukascopy_ticks_to_bars(
+    payload: bytes,
+    base_dt: datetime,
+    interval: str,
+    price_scale: int,
+) -> pd.DataFrame:
+    if not payload:
+        return pd.DataFrame()
+    try:
+        raw = lzma.decompress(payload)
+    except Exception:
+        return pd.DataFrame()
+    if not raw:
+        return pd.DataFrame()
+
+    dtype = np.dtype(
+        [
+            ("ms", ">u4"),
+            ("ask", ">u4"),
+            ("bid", ">u4"),
+            ("askvol", ">f4"),
+            ("bidvol", ">f4"),
+        ]
+    )
+    if len(raw) < dtype.itemsize:
+        return pd.DataFrame()
+
+    ticks = np.frombuffer(raw, dtype=dtype)
+    if ticks.size == 0:
+        return pd.DataFrame()
+
+    base_ts = base_dt.replace(tzinfo=timezone.utc).timestamp()
+    times = base_ts + (ticks["ms"].astype("float64") / 1000.0)
+    index = pd.to_datetime(times, unit="s", utc=True)
+    price = (ticks["ask"].astype("float64") + ticks["bid"].astype("float64")) / (2 * price_scale)
+    volume = ticks["askvol"].astype("float64") + ticks["bidvol"].astype("float64")
+    df = pd.DataFrame({"price": price, "volume": volume}, index=index)
+
+    rule = "1min" if interval == "1m" else "5min"
+    ohlc = df["price"].resample(rule).ohlc()
+    vol = df["volume"].resample(rule).sum()
+    bars = pd.concat([ohlc, vol], axis=1)
+    bars = bars.rename(columns={"volume": "volume"})
+    return bars.dropna(subset=["open", "high", "low", "close"])
+
+
+def fetch_ohlcv_dukascopy(
+    ticker: str,
+    interval: str,
+    start: Optional[str],
+    end: Optional[str],
+) -> pd.DataFrame:
+    if interval not in {"1m", "5m"}:
+        raise HTTPException(status_code=400, detail="Dukascopy supports 1m and 5m intervals only.")
+
+    instrument = _dukascopy_instrument(ticker)
+    if not instrument:
+        raise HTTPException(status_code=400, detail=f"Unsupported ticker: {ticker}")
+
+    start_date = _parse_date_only(start)
+    end_date = _parse_date_only(end)
+    if not start_date or not end_date:
+        end_date = datetime.now(timezone.utc).date()
+        window_days = 7 if interval == "1m" else 60
+        start_date = end_date - timedelta(days=window_days)
+
+    price_scale = _dukascopy_price_scale(instrument)
+    bars: List[pd.DataFrame] = []
+
+    current = datetime.combine(start_date, dt_time(0, 0))
+    final = datetime.combine(end_date, dt_time(23, 0))
+    hours: List[datetime] = []
+    skipped = 0
+
+    while current <= final:
+        if _dukascopy_skip_hour(current):
+            skipped += 1
+        else:
+            hours.append(current)
+        current += timedelta(hours=1)
+
+    total_hours = len(hours)
+    processed = 0
+    cached_hits = 0
+    downloaded = 0
+    missing = 0
+    retry_attempts = 0
+    start_ts = time.time()
+
+    progress_key = f"{_dukascopy_instrument(ticker)}|{interval}"
+    _DUKASCOPY_PROGRESS[progress_key] = {
+        "processed": 0.0,
+        "total": float(total_hours),
+        "cached": 0.0,
+        "downloaded": 0.0,
+        "missing": 0.0,
+        "retry_attempts": 0.0,
+        "skipped": float(skipped),
+        "speed": 0.0,
+        "eta_seconds": 0.0,
+        "updated_at": time.time(),
+    }
+
+    if not hours:
+        return pd.DataFrame()
+
+    batch_size = max(DUKASCOPY_BATCH_HOURS, 1)
+    workers = max(DUKASCOPY_MAX_WORKERS, 1)
+
+    def update_progress() -> None:
+        elapsed = max(time.time() - start_ts, 0.001)
+        speed = processed / elapsed if processed else 0.0
+        remaining = max(total_hours - processed, 0)
+        if remaining == 0 and missing > 0:
+            remaining = missing
+        eta_seconds = (remaining / speed) if speed else 0.0
+        _DUKASCOPY_PROGRESS[progress_key] = {
+            "processed": float(processed),
+            "total": float(total_hours),
+            "cached": float(cached_hits),
+            "downloaded": float(downloaded),
+            "missing": float(missing),
+            "retry_attempts": float(retry_attempts),
+            "skipped": float(skipped),
+            "speed": float(speed),
+            "eta_seconds": float(eta_seconds),
+            "updated_at": time.time(),
+        }
+
+    def process_hours(hours_to_fetch: List[datetime], count_unique: bool) -> List[datetime]:
+        nonlocal processed, cached_hits, downloaded, missing, retry_attempts
+        remaining_missing: List[datetime] = []
+
+        total = len(hours_to_fetch)
+        for batch_start in range(0, total, batch_size):
+            if _dukascopy_wait_if_paused():
+                _LOGGER.info("Dukascopy download canceled for %s %s", instrument, interval)
+                return remaining_missing
+            batch = hours_to_fetch[batch_start : batch_start + batch_size]
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(_dukascopy_load_hour, instrument, hour): hour
+                    for hour in batch
+                }
+                for future in as_completed(futures):
+                    if _DUKASCOPY_CONTROL["cancel"]:
+                        return remaining_missing
+                    hour = futures[future]
+                    try:
+                        payload, was_cached = future.result()
+                    except Exception:
+                        payload, was_cached = None, False
+
+                    if count_unique:
+                        processed += 1
+                    else:
+                        retry_attempts += 1
+
+                    if payload:
+                        if was_cached:
+                            cached_hits += 1
+                        else:
+                            downloaded += 1
+                        if not count_unique and missing > 0:
+                            missing -= 1
+                        bars.append(_dukascopy_ticks_to_bars(payload, hour, interval, price_scale))
+                    else:
+                        remaining_missing.append(hour)
+                        if count_unique:
+                            missing += 1
+
+                    update_progress()
+
+            if DUKASCOPY_LOG_PROGRESS:
+                log_every = max(DUKASCOPY_LOG_EVERY_HOURS, 1)
+                if processed == total_hours or processed % log_every == 0 or processed <= batch_size:
+                    _LOGGER.info(
+                        "Dukascopy %s %s: %s/%s hours (cached %s, downloaded %s, missing %s, skipped %s)",
+                        instrument,
+                        interval,
+                        processed,
+                        total_hours,
+                        cached_hits,
+                        downloaded,
+                        missing,
+                        skipped,
+                    )
+
+        return remaining_missing
+
+    missing_hours = process_hours(hours, True)
+
+    if DUKASCOPY_AUTO_RESUME and missing_hours:
+        for _ in range(max(DUKASCOPY_RETRY_PASSES, 1)):
+            if not missing_hours or _DUKASCOPY_CONTROL["cancel"]:
+                break
+            missing_hours = process_hours(missing_hours, False)
+            missing = len(missing_hours)
+            update_progress()
+
+    if not bars:
+        return pd.DataFrame()
+
+    df = pd.concat(bars).sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+    df = df[["open", "high", "low", "close", "volume"]]
+    df.index = pd.to_datetime(df.index, utc=True)
+    return df
+
+
+def fetch_ohlcv_backtest(ticker: str, request: BacktestRequest) -> pd.DataFrame:
+    if BACKTEST_DATA_SOURCE == "dukascopy":
+        return fetch_ohlcv_dukascopy(ticker, request.interval, request.start, request.end)
+    return fetch_ohlcv(ticker, request.interval)
+
+
 DEFAULT_SWEEP_TICKERS = [
     "EURUSD=X",
     "GBPUSD=X",
@@ -210,6 +524,44 @@ SWEEP_NY_OPEN_END = _env_time("SWEEP_NY_OPEN_END", dt_time(10, 0))
 
 SWEEP_TICKERS = _parse_ticker_list(os.getenv("SWEEP_TICKERS")) or DEFAULT_SWEEP_TICKERS
 _SWEEP_ALERT_CACHE: dict[tuple[str, str, str, int], float] = {}
+
+BACKTEST_DATA_SOURCE = os.getenv("BACKTEST_DATA_SOURCE", "yahoo").strip().lower()
+DUKASCOPY_BASE_URL = os.getenv("DUKASCOPY_BASE_URL", "https://datafeed.dukascopy.com/datafeed")
+DUKASCOPY_CACHE_DIR = os.getenv(
+    "DUKASCOPY_CACHE_DIR",
+    os.path.join(_BASE_DIR, "data", "dukascopy"),
+)
+DUKASCOPY_TIMEOUT_SECONDS = _env_int("DUKASCOPY_TIMEOUT_SECONDS", 12)
+DUKASCOPY_LOG_PROGRESS = _env_bool("DUKASCOPY_LOG_PROGRESS", False)
+DUKASCOPY_LOG_EVERY_HOURS = _env_int("DUKASCOPY_LOG_EVERY_HOURS", 24)
+DUKASCOPY_SKIP_WEEKENDS = _env_bool("DUKASCOPY_SKIP_WEEKENDS", True)
+DUKASCOPY_MAX_WORKERS = _env_int("DUKASCOPY_MAX_WORKERS", 6)
+DUKASCOPY_BATCH_HOURS = _env_int("DUKASCOPY_BATCH_HOURS", 24)
+DUKASCOPY_RETRY_MAX = _env_int("DUKASCOPY_RETRY_MAX", 2)
+DUKASCOPY_AUTO_RESUME = _env_bool("DUKASCOPY_AUTO_RESUME", True)
+DUKASCOPY_RETRY_PASSES = _env_int("DUKASCOPY_RETRY_PASSES", 1)
+
+_DUKASCOPY_SESSION = requests.Session()
+_DUKASCOPY_SESSION.headers.update(
+    {
+        "User-Agent": os.getenv(
+            "DUKASCOPY_USER_AGENT",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        )
+    }
+)
+
+_DUKASCOPY_PROGRESS: dict[str, dict[str, float]] = {}
+_DUKASCOPY_CONTROL = {"pause": False, "cancel": False}
+_BATCH_PROGRESS = {
+    "status": "idle",
+    "processed": 0,
+    "total": 0,
+    "current_year": None,
+    "updated_at": 0.0,
+}
+_BATCH_CONTROL = {"cancel": False}
 
 
 def _yf_download(*args, **kwargs) -> pd.DataFrame:
@@ -334,6 +686,139 @@ class SweepStatusResponse(BaseModel):
     tickers: List[str]
 
 
+class BacktestRequest(BaseModel):
+    tickers: List[str]
+    interval: Literal["1m", "5m"] = "5m"
+    session: Literal["london", "newyork", "both"] = "newyork"
+    start: Optional[str] = None  # YYYY-MM-DD or ISO date
+    end: Optional[str] = None
+    starting_balance: float = 10000.0
+    risk_per_trade: float = 0.005
+    max_trades_per_day: int = 2
+    sweep_atr_mult: float = 0.8
+    return_within_bars: int = 4
+    fvg_min_atr_mult: float = 0.1
+    fvg_retrace_window: int = 8
+    stop_atr_mult: float = 1.2
+    target_rr: float = 2.0
+
+
+class BacktestTrade(BaseModel):
+    ticker: str
+    session: Literal["london", "newyork"]
+    direction: Literal["long", "short"]
+    level_name: str
+    sweep_time: int
+    fvg_time: Optional[int]
+    entry_time: int
+    entry_price: float
+    stop_price: float
+    target_price: float
+    exit_time: int
+    exit_price: float
+    result: Literal["win", "loss", "breakeven"]
+    r_multiple: float
+    pnl: float
+
+
+class BacktestSummary(BaseModel):
+    starting_balance: float
+    ending_balance: float
+    return_pct: float
+    total_trades: int
+    wins: int
+    losses: int
+    breakeven: int
+    win_rate: float
+    profit_factor: Optional[float]
+    max_drawdown: float
+
+
+class BacktestResponse(BaseModel):
+    meta: dict
+    summary: BacktestSummary
+    session_breakdown: List[SessionBreakdown]
+    equity_curve: List[EquityPoint]
+    trades: List[BacktestTrade]
+
+
+class EquityPoint(BaseModel):
+    time: int
+    equity: float
+
+
+class SessionBreakdown(BaseModel):
+    session: Literal["london", "newyork"]
+    total_trades: int
+    wins: int
+    losses: int
+    breakeven: int
+    win_rate: float
+    profit_factor: Optional[float]
+    return_pct: float
+
+
+class GridSearchRequest(BaseModel):
+    base: BacktestRequest
+    sweep_atr_mults: List[float] = [0.4, 0.5, 0.6]
+    return_within_bars: List[int] = [10, 20, 30]
+    fvg_min_atr_mults: List[float] = [0.0, 0.1]
+    fvg_retrace_windows: List[int] = [8, 12, 16]
+    stop_atr_mults: List[float] = [1.0, 1.2]
+    target_rrs: List[float] = [1.5, 2.0]
+    max_combinations: int = 200
+    top_n: int = 10
+    sort_by: Literal["return_pct", "profit_factor", "score"] = "return_pct"
+
+
+class GridSearchResult(BaseModel):
+    params: dict
+    summary: BacktestSummary
+    score: float
+
+
+class GridSearchResponse(BaseModel):
+    meta: dict
+    results: List[GridSearchResult]
+
+
+class BacktestBatchRequest(BaseModel):
+    base: BacktestRequest
+    start_year: Optional[int] = None
+    end_year: Optional[int] = None
+
+
+class BacktestYearResult(BaseModel):
+    year: int
+    summary: BacktestSummary
+    total_trades: int
+    data_ranges: dict
+
+
+class BacktestBatchResponse(BaseModel):
+    meta: dict
+    results: List[BacktestYearResult]
+
+
+class DukascopyProgressResponse(BaseModel):
+    paused: bool
+    canceled: bool
+    sources: List[dict]
+
+
+class DukascopyControlResponse(BaseModel):
+    paused: bool
+    canceled: bool
+
+
+class BatchProgressResponse(BaseModel):
+    status: Literal["idle", "running", "done"]
+    processed: int
+    total: int
+    current_year: Optional[int]
+    updated_at: float
+
+
 def fetch_ohlcv(ticker: str, interval: str) -> pd.DataFrame:
     cache_key = (ticker.upper(), interval)
     cached = _ohlcv_cache.get(cache_key)
@@ -347,8 +832,9 @@ def fetch_ohlcv(ticker: str, interval: str) -> pd.DataFrame:
     if not yf_interval:
         raise HTTPException(status_code=400, detail=f"Unsupported interval: {interval}")
 
-    if interval in {"5m", "1h", "4h"}:
-        raw_df = fetch_intraday_ohlcv(ticker, yf_interval, INTERVAL_SECONDS[interval])
+    if interval in {"1m", "5m", "1h", "4h"}:
+        periods = INTRADAY_PERIODS_1M if interval == "1m" else INTRADAY_PERIODS
+        raw_df = fetch_intraday_ohlcv(ticker, yf_interval, INTERVAL_SECONDS[interval], periods=periods)
     else:
         period = PERIOD_MAP[interval]
         try:
@@ -373,8 +859,9 @@ def fetch_ohlcv(ticker: str, interval: str) -> pd.DataFrame:
         period = PERIOD_MAP[interval]
         df = normalize_ohlcv(fetch_ohlcv_history(ticker, period, yf_interval))
 
-    if df.empty and interval in {"5m", "1h", "4h"}:
-        for fallback in ("2y", "1y", "6mo", "3mo", "60d"):
+    if df.empty and interval in {"1m", "5m", "1h", "4h"}:
+        fallbacks = ("7d", "5d", "1d") if interval == "1m" else ("2y", "1y", "6mo", "3mo", "60d")
+        for fallback in fallbacks:
             df = normalize_ohlcv(fetch_ohlcv_history(ticker, fallback, yf_interval))
             if not df.empty:
                 break
@@ -438,11 +925,16 @@ def fetch_ohlcv_chart(ticker: str, period: str, interval: str) -> pd.DataFrame:
     return df
 
 
-def fetch_intraday_ohlcv(ticker: str, yf_interval: str, expected_seconds: int) -> pd.DataFrame:
+def fetch_intraday_ohlcv(
+    ticker: str,
+    yf_interval: str,
+    expected_seconds: int,
+    periods: Optional[List[str]] = None,
+) -> pd.DataFrame:
     best_df = pd.DataFrame()
     best_step = None
 
-    for period in INTRADAY_PERIODS:
+    for period in (periods or INTRADAY_PERIODS):
         df = pd.DataFrame()
         try:
             df = _yf_download(
@@ -1209,6 +1701,545 @@ def run_sweep_scan(
     return events
 
 
+def _parse_date_only(value: Optional[str]) -> Optional[date]:
+    if not value:
+        return None
+    try:
+        parsed = pd.to_datetime(value)
+    except Exception:
+        return None
+    if isinstance(parsed, pd.Timestamp):
+        return parsed.date()
+    return None
+
+
+def _filter_df_by_dates(df: pd.DataFrame, zone: ZoneInfo, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
+    if df.empty:
+        return df
+    start_date = _parse_date_only(start)
+    end_date = _parse_date_only(end)
+    if not start_date and not end_date:
+        return df
+
+    index = df.index
+    if index.tz is None:
+        index = index.tz_localize("UTC")
+    local_index = index.tz_convert(zone)
+    local_dates = local_index.date
+
+    mask = np.ones(len(df), dtype=bool)
+    if start_date:
+        mask &= local_dates >= start_date
+    if end_date:
+        mask &= local_dates <= end_date
+
+    return df.loc[mask]
+
+
+def _build_daily_levels(df: pd.DataFrame, zone: ZoneInfo) -> Dict[date, Dict[str, float]]:
+    if df.empty:
+        return {}
+
+    index = df.index
+    if index.tz is None:
+        index = index.tz_localize("UTC")
+    local_index = index.tz_convert(zone)
+    local_dates = local_index.date
+
+    levels_by_date: Dict[date, Dict[str, float]] = {}
+    for current_date in sorted(set(local_dates)):
+        day_levels: Dict[str, float] = {}
+        prev_date = current_date - timedelta(days=1)
+
+        prev_mask = local_dates == prev_date
+        if prev_mask.any():
+            day_levels["prev_day_high"] = float(df.loc[prev_mask, "high"].max())
+            day_levels["prev_day_low"] = float(df.loc[prev_mask, "low"].min())
+
+        asia_mask = _build_session_mask(
+            local_index,
+            current_date,
+            SWEEP_ASIA_START,
+            SWEEP_ASIA_END,
+            include_prev_for_wrap=True,
+        )
+        if asia_mask.any():
+            day_levels["asia_high"] = float(df.loc[asia_mask, "high"].max())
+            day_levels["asia_low"] = float(df.loc[asia_mask, "low"].min())
+
+        london_mask = _build_session_mask(
+            local_index,
+            current_date,
+            SWEEP_LONDON_START,
+            SWEEP_LONDON_END,
+        )
+        if london_mask.any():
+            day_levels["london_high"] = float(df.loc[london_mask, "high"].max())
+            day_levels["london_low"] = float(df.loc[london_mask, "low"].min())
+
+        levels_by_date[current_date] = day_levels
+
+    return levels_by_date
+
+
+def _levels_for_session(levels_by_date: Dict[date, Dict[str, float]], trade_date: date, session: str) -> List[Tuple[str, float]]:
+    levels = levels_by_date.get(trade_date, {})
+    selected: List[Tuple[str, float]] = []
+
+    if "prev_day_high" in levels:
+        selected.append(("prev_day_high", levels["prev_day_high"]))
+    if "prev_day_low" in levels:
+        selected.append(("prev_day_low", levels["prev_day_low"]))
+
+    if "asia_high" in levels:
+        selected.append(("asia_high", levels["asia_high"]))
+    if "asia_low" in levels:
+        selected.append(("asia_low", levels["asia_low"]))
+
+    if session == "newyork":
+        if "london_high" in levels:
+            selected.append(("london_high", levels["london_high"]))
+        if "london_low" in levels:
+            selected.append(("london_low", levels["london_low"]))
+
+    return selected
+
+
+def _detect_fvg(
+    df: pd.DataFrame,
+    idx: int,
+    direction: Literal["long", "short"],
+    min_gap: float,
+) -> Optional[Tuple[float, float]]:
+    if idx < 2:
+        return None
+    high_prev2 = float(df.iloc[idx - 2]["high"])
+    low_prev2 = float(df.iloc[idx - 2]["low"])
+    high_curr = float(df.iloc[idx]["high"])
+    low_curr = float(df.iloc[idx]["low"])
+
+    if direction == "long":
+        gap = low_curr - high_prev2
+        if gap >= min_gap:
+            return (high_prev2, low_curr)
+    else:
+        gap = low_prev2 - high_curr
+        if gap >= min_gap:
+            return (high_curr, low_prev2)
+    return None
+
+
+def _simulate_exit(
+    df: pd.DataFrame,
+    entry_idx: int,
+    session_end_idx: int,
+    direction: Literal["long", "short"],
+    stop_price: float,
+    target_price: float,
+) -> Tuple[int, float]:
+    for idx in range(entry_idx + 1, session_end_idx + 1):
+        high = float(df.iloc[idx]["high"])
+        low = float(df.iloc[idx]["low"])
+        if direction == "long":
+            hit_stop = low <= stop_price
+            hit_target = high >= target_price
+        else:
+            hit_stop = high >= stop_price
+            hit_target = low <= target_price
+
+        if hit_stop and hit_target:
+            return idx, stop_price
+        if hit_stop:
+            return idx, stop_price
+        if hit_target:
+            return idx, target_price
+
+    final_close = float(df.iloc[session_end_idx]["close"])
+    return session_end_idx, final_close
+
+
+def _run_backtest_for_ticker(
+    ticker: str,
+    df: pd.DataFrame,
+    request: BacktestRequest,
+    zone: ZoneInfo,
+) -> List[BacktestTrade]:
+    if df.empty:
+        return []
+
+    df = df.dropna(subset=["open", "high", "low", "close"]).sort_index()
+    if df.empty:
+        return []
+
+    df = _filter_df_by_dates(df, zone, request.start, request.end)
+    if df.empty:
+        return []
+
+    df = df.copy()
+    df["atr"] = compute_atr(df["high"], df["low"], df["close"], length=14)
+
+    index = df.index
+    if index.tz is None:
+        index = index.tz_localize("UTC")
+    local_index = index.tz_convert(zone)
+    local_dates = local_index.date
+
+    levels_by_date = _build_daily_levels(df, zone)
+    unique_dates = sorted(set(local_dates))
+    trades: List[BacktestTrade] = []
+
+    for current_date in unique_dates:
+        trades_today = 0
+
+        for session_name in ("london", "newyork"):
+            if request.session not in {session_name, "both"}:
+                continue
+            if trades_today >= request.max_trades_per_day:
+                break
+
+            if session_name == "london":
+                start_time = SWEEP_LONDON_START
+                end_time = SWEEP_LONDON_END
+            else:
+                start_time = SWEEP_NY_OPEN_START
+                end_time = SWEEP_NY_OPEN_END
+
+            session_mask = _build_session_mask(local_index, current_date, start_time, end_time)
+            session_positions = np.where(session_mask)[0]
+            if session_positions.size == 0:
+                continue
+
+            levels = _levels_for_session(levels_by_date, current_date, session_name)
+            if not levels:
+                continue
+
+            session_end_idx = int(session_positions[-1])
+            pos_ptr = 0
+
+            while pos_ptr < len(session_positions) and trades_today < request.max_trades_per_day:
+                idx = int(session_positions[pos_ptr])
+                row = df.iloc[idx]
+                atr_value = row.get("atr")
+                if atr_value is None or not math.isfinite(atr_value) or atr_value <= 0:
+                    pos_ptr += 1
+                    continue
+
+                sweep_threshold = request.sweep_atr_mult * float(atr_value)
+                sweep_found = None
+
+                for level_name, level_price in levels:
+                    if row["low"] < level_price - sweep_threshold:
+                        sweep_found = ("long", level_name, level_price)
+                        break
+                    if row["high"] > level_price + sweep_threshold:
+                        sweep_found = ("short", level_name, level_price)
+                        break
+
+                if not sweep_found:
+                    pos_ptr += 1
+                    continue
+
+                direction, level_name, level_price = sweep_found
+                return_idx = None
+                max_return = min(idx + request.return_within_bars, session_end_idx)
+
+                for j in range(idx, max_return + 1):
+                    close = float(df.iloc[j]["close"])
+                    if direction == "long" and close > level_price:
+                        return_idx = j
+                        break
+                    if direction == "short" and close < level_price:
+                        return_idx = j
+                        break
+
+                if return_idx is None:
+                    pos_ptr += 1
+                    continue
+
+                fvg_found = None
+                fvg_idx = None
+                max_fvg_search = min(return_idx + request.return_within_bars, session_end_idx)
+
+                for k in range(return_idx + 2, max_fvg_search + 1):
+                    atr_k = df.iloc[k]["atr"]
+                    if atr_k is None or not math.isfinite(atr_k):
+                        continue
+                    min_gap = request.fvg_min_atr_mult * float(atr_k)
+                    fvg = _detect_fvg(df, k, direction, min_gap)
+                    if fvg:
+                        fvg_found = fvg
+                        fvg_idx = k
+                        break
+
+                if fvg_found is None or fvg_idx is None:
+                    pos_ptr += 1
+                    continue
+
+                gap_low, gap_high = fvg_found
+                entry_mid = (gap_low + gap_high) / 2
+                entry_idx = None
+                max_retrace = min(fvg_idx + request.fvg_retrace_window, session_end_idx)
+
+                for m in range(fvg_idx + 1, max_retrace + 1):
+                    high = float(df.iloc[m]["high"])
+                    low = float(df.iloc[m]["low"])
+                    if low <= entry_mid <= high:
+                        entry_idx = m
+                        break
+
+                if entry_idx is None:
+                    pos_ptr += 1
+                    continue
+
+                atr_entry = df.iloc[entry_idx]["atr"]
+                if atr_entry is None or not math.isfinite(atr_entry) or atr_entry <= 0:
+                    pos_ptr += 1
+                    continue
+
+                if direction == "long":
+                    sweep_extreme = float(df.iloc[idx : return_idx + 1]["low"].min())
+                    stop_atr = entry_mid - request.stop_atr_mult * float(atr_entry)
+                    stop_price = min(sweep_extreme, stop_atr)
+                    risk = entry_mid - stop_price
+                    target_price = entry_mid + risk * request.target_rr
+                else:
+                    sweep_extreme = float(df.iloc[idx : return_idx + 1]["high"].max())
+                    stop_atr = entry_mid + request.stop_atr_mult * float(atr_entry)
+                    stop_price = max(sweep_extreme, stop_atr)
+                    risk = stop_price - entry_mid
+                    target_price = entry_mid - risk * request.target_rr
+
+                if risk <= 0:
+                    pos_ptr += 1
+                    continue
+
+                exit_idx, exit_price = _simulate_exit(
+                    df,
+                    entry_idx,
+                    session_end_idx,
+                    direction,
+                    stop_price,
+                    target_price,
+                )
+
+                if direction == "long":
+                    r_multiple = (exit_price - entry_mid) / risk
+                else:
+                    r_multiple = (entry_mid - exit_price) / risk
+
+                result = "breakeven"
+                if r_multiple > 0:
+                    result = "win"
+                elif r_multiple < 0:
+                    result = "loss"
+
+                trades.append(
+                    BacktestTrade(
+                        ticker=ticker,
+                        session=session_name,
+                        direction=direction,
+                        level_name=level_name,
+                        sweep_time=int(index[idx].timestamp()),
+                        fvg_time=int(index[fvg_idx].timestamp()) if fvg_idx is not None else None,
+                        entry_time=int(index[entry_idx].timestamp()),
+                        entry_price=float(entry_mid),
+                        stop_price=float(stop_price),
+                        target_price=float(target_price),
+                        exit_time=int(index[exit_idx].timestamp()),
+                        exit_price=float(exit_price),
+                        result=result,
+                        r_multiple=float(r_multiple),
+                        pnl=0.0,
+                    )
+                )
+
+                trades_today += 1
+                # Jump ahead to avoid overlapping positions.
+                while pos_ptr < len(session_positions) and session_positions[pos_ptr] <= exit_idx:
+                    pos_ptr += 1
+                continue
+
+            if trades_today >= request.max_trades_per_day:
+                break
+
+    return trades
+
+
+def _summarize_backtest(
+    trades: List[BacktestTrade],
+    starting_balance: float,
+    risk_per_trade: float,
+) -> Tuple[BacktestSummary, List[EquityPoint], List[SessionBreakdown]]:
+    if not trades:
+        summary = BacktestSummary(
+            starting_balance=starting_balance,
+            ending_balance=starting_balance,
+            return_pct=0.0,
+            total_trades=0,
+            wins=0,
+            losses=0,
+            breakeven=0,
+            win_rate=0.0,
+            profit_factor=None,
+            max_drawdown=0.0,
+        )
+        return summary, [], []
+
+    sorted_trades = sorted(trades, key=lambda trade: trade.entry_time)
+    equity = starting_balance
+    peak = starting_balance
+    max_drawdown = 0.0
+    wins = 0
+    losses = 0
+    breakeven = 0
+    total_profit = 0.0
+    total_loss = 0.0
+    equity_curve: List[EquityPoint] = []
+
+    for trade in sorted_trades:
+        risk_amount = equity * risk_per_trade
+        trade.pnl = float(risk_amount * trade.r_multiple)
+        equity += trade.pnl
+        equity_curve.append(EquityPoint(time=trade.exit_time, equity=equity))
+
+        if trade.pnl > 0:
+            wins += 1
+            total_profit += trade.pnl
+        elif trade.pnl < 0:
+            losses += 1
+            total_loss += trade.pnl
+        else:
+            breakeven += 1
+
+        if equity > peak:
+            peak = equity
+        drawdown = (peak - equity) / peak if peak > 0 else 0.0
+        if drawdown > max_drawdown:
+            max_drawdown = drawdown
+
+    total_trades = len(sorted_trades)
+    win_rate = wins / total_trades if total_trades else 0.0
+    profit_factor = None
+    if total_loss < 0:
+        profit_factor = total_profit / abs(total_loss)
+
+    summary = BacktestSummary(
+        starting_balance=starting_balance,
+        ending_balance=equity,
+        return_pct=((equity - starting_balance) / starting_balance) * 100.0 if starting_balance else 0.0,
+        total_trades=total_trades,
+        wins=wins,
+        losses=losses,
+        breakeven=breakeven,
+        win_rate=win_rate,
+        profit_factor=profit_factor,
+        max_drawdown=max_drawdown,
+    )
+
+    session_breakdown: List[SessionBreakdown] = []
+    for session in ("london", "newyork"):
+        session_trades = [trade for trade in sorted_trades if trade.session == session]
+        if not session_trades:
+            continue
+        session_profit = sum(trade.pnl for trade in session_trades if trade.pnl > 0)
+        session_loss = sum(trade.pnl for trade in session_trades if trade.pnl < 0)
+        session_wins = sum(1 for trade in session_trades if trade.pnl > 0)
+        session_losses = sum(1 for trade in session_trades if trade.pnl < 0)
+        session_breakeven = sum(1 for trade in session_trades if trade.pnl == 0)
+        session_total = len(session_trades)
+        session_pf = None if session_loss == 0 else session_profit / abs(session_loss)
+        session_breakdown.append(
+            SessionBreakdown(
+                session=session,
+                total_trades=session_total,
+                wins=session_wins,
+                losses=session_losses,
+                breakeven=session_breakeven,
+                win_rate=session_wins / session_total if session_total else 0.0,
+                profit_factor=session_pf,
+                return_pct=(sum(trade.pnl for trade in session_trades) / starting_balance) * 100.0
+                if starting_balance
+                else 0.0,
+            )
+        )
+
+    return summary, equity_curve, session_breakdown
+
+
+def _validate_backtest_request(request: BacktestRequest) -> None:
+    if request.interval not in {"1m", "5m"}:
+        raise HTTPException(status_code=400, detail="Interval must be 1m or 5m for backtests.")
+    if request.risk_per_trade <= 0 or request.risk_per_trade > 0.05:
+        raise HTTPException(status_code=400, detail="risk_per_trade must be between 0 and 0.05.")
+    if request.max_trades_per_day < 1:
+        raise HTTPException(status_code=400, detail="max_trades_per_day must be >= 1.")
+    if request.return_within_bars < 1:
+        raise HTTPException(status_code=400, detail="return_within_bars must be >= 1.")
+    if request.fvg_retrace_window < 1:
+        raise HTTPException(status_code=400, detail="fvg_retrace_window must be >= 1.")
+
+
+def _prepare_backtest_data(
+    request: BacktestRequest,
+    zone: ZoneInfo,
+) -> Tuple[List[str], Dict[str, pd.DataFrame], Dict[str, Dict[str, Optional[int]]]]:
+    tickers = [_normalize_fx_ticker(ticker) for ticker in request.tickers if ticker.strip()]
+    tickers = [ticker for ticker in tickers if ticker]
+    if not tickers:
+        raise HTTPException(status_code=400, detail="No tickers provided for backtest.")
+
+    data_by_ticker: Dict[str, pd.DataFrame] = {}
+    data_ranges: Dict[str, Dict[str, Optional[int]]] = {}
+
+    for ticker in tickers:
+        try:
+            df = fetch_ohlcv_backtest(ticker, request)
+        except HTTPException as exc:
+            _LOGGER.warning("Backtest skipped %s: %s", ticker, exc.detail)
+            continue
+        except Exception as exc:  # pragma: no cover
+            _LOGGER.warning("Backtest failed %s: %s", ticker, exc)
+            continue
+
+        df = _filter_df_by_dates(df, zone, request.start, request.end)
+        if df.empty:
+            continue
+
+        data_by_ticker[ticker] = df
+        data_ranges[ticker] = {
+            "start": int(df.index[0].timestamp()),
+            "end": int(df.index[-1].timestamp()),
+        }
+
+    return tickers, data_by_ticker, data_ranges
+
+
+def _build_year_segments(
+    start_date: Optional[date],
+    end_date: Optional[date],
+    start_year: Optional[int],
+    end_year: Optional[int],
+) -> List[Tuple[int, date, date]]:
+    if not start_date or not end_date:
+        raise HTTPException(status_code=400, detail="Batch backtest requires start and end dates.")
+
+    year_start = start_year or start_date.year
+    year_end = end_year or end_date.year
+    if year_start > year_end:
+        raise HTTPException(status_code=400, detail="start_year must be <= end_year.")
+
+    segments: List[Tuple[int, date, date]] = []
+    for year in range(year_start, year_end + 1):
+        seg_start = max(start_date, date(year, 1, 1))
+        seg_end = min(end_date, date(year, 12, 31))
+        if seg_start <= seg_end:
+            segments.append((year, seg_start, seg_end))
+
+    if not segments:
+        raise HTTPException(status_code=400, detail="No valid year segments in the given range.")
+    return segments
+
+
 def summarize_ticker(ticker: str, interval: str) -> ScanResult:
     try:
         df = fetch_ohlcv(ticker, interval)
@@ -1425,6 +2456,350 @@ def sweeps_status() -> SweepStatusResponse:
         ny_open_end=SWEEP_NY_OPEN_END.strftime("%H:%M"),
         tickers=SWEEP_TICKERS,
     )
+
+
+@app.post("/backtest/sweep", response_model=BacktestResponse)
+def backtest_sweep(request: BacktestRequest) -> BacktestResponse:
+    zone = _get_sweep_zone()
+    _validate_backtest_request(request)
+    tickers, data_by_ticker, data_ranges = _prepare_backtest_data(request, zone)
+    trades: List[BacktestTrade] = []
+
+    for ticker, df in data_by_ticker.items():
+        trades.extend(_run_backtest_for_ticker(ticker, df, request, zone))
+
+    sorted_trades = sorted(trades, key=lambda trade: trade.entry_time)
+    summary, equity_curve, session_breakdown = _summarize_backtest(
+        sorted_trades,
+        request.starting_balance,
+        request.risk_per_trade,
+    )
+
+    meta = {
+        "tickers": tickers,
+        "interval": request.interval,
+        "session": request.session,
+        "timezone": SWEEP_TIMEZONE,
+        "ny_open_start": SWEEP_NY_OPEN_START.strftime("%H:%M"),
+        "ny_open_end": SWEEP_NY_OPEN_END.strftime("%H:%M"),
+        "london_start": SWEEP_LONDON_START.strftime("%H:%M"),
+        "london_end": SWEEP_LONDON_END.strftime("%H:%M"),
+        "data_ranges": data_ranges,
+        "notes": "Intraday Yahoo data is limited (1m ~7d, 5m ~60d).",
+    }
+    return BacktestResponse(
+        meta=meta,
+        summary=summary,
+        session_breakdown=session_breakdown,
+        equity_curve=equity_curve,
+        trades=sorted_trades,
+    )
+
+
+@app.post("/backtest/sweep/csv")
+def backtest_sweep_csv(request: BacktestRequest) -> Response:
+    result = backtest_sweep(request)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "ticker",
+            "session",
+            "direction",
+            "level_name",
+            "sweep_time",
+            "fvg_time",
+            "entry_time",
+            "entry_price",
+            "stop_price",
+            "target_price",
+            "exit_time",
+            "exit_price",
+            "result",
+            "r_multiple",
+            "pnl",
+        ]
+    )
+    for trade in result.trades:
+        writer.writerow(
+            [
+                trade.ticker,
+                trade.session,
+                trade.direction,
+                trade.level_name,
+                trade.sweep_time,
+                trade.fvg_time or "",
+                trade.entry_time,
+                trade.entry_price,
+                trade.stop_price,
+                trade.target_price,
+                trade.exit_time,
+                trade.exit_price,
+                trade.result,
+                trade.r_multiple,
+                trade.pnl,
+            ]
+        )
+    return Response(content=output.getvalue(), media_type="text/csv")
+
+
+@app.post("/backtest/sweep/grid", response_model=GridSearchResponse)
+def backtest_sweep_grid(request: GridSearchRequest) -> GridSearchResponse:
+    zone = _get_sweep_zone()
+    _validate_backtest_request(request.base)
+    tickers, data_by_ticker, data_ranges = _prepare_backtest_data(request.base, zone)
+
+    sweep_atr_mults = request.sweep_atr_mults or [request.base.sweep_atr_mult]
+    return_within_bars = request.return_within_bars or [request.base.return_within_bars]
+    fvg_min_atr_mults = request.fvg_min_atr_mults or [request.base.fvg_min_atr_mult]
+    fvg_retrace_windows = request.fvg_retrace_windows or [request.base.fvg_retrace_window]
+    stop_atr_mults = request.stop_atr_mults or [request.base.stop_atr_mult]
+    target_rrs = request.target_rrs or [request.base.target_rr]
+
+    results: List[GridSearchResult] = []
+    total_tested = 0
+
+    for combo in itertools.product(
+        sweep_atr_mults,
+        return_within_bars,
+        fvg_min_atr_mults,
+        fvg_retrace_windows,
+        stop_atr_mults,
+        target_rrs,
+    ):
+        if total_tested >= request.max_combinations:
+            break
+
+        sweep_mult, return_bars, fvg_min, fvg_retrace, stop_mult, target_rr = combo
+        candidate = request.base.model_copy(
+            update={
+                "sweep_atr_mult": sweep_mult,
+                "return_within_bars": return_bars,
+                "fvg_min_atr_mult": fvg_min,
+                "fvg_retrace_window": fvg_retrace,
+                "stop_atr_mult": stop_mult,
+                "target_rr": target_rr,
+            }
+        )
+
+        trades: List[BacktestTrade] = []
+        for ticker, df in data_by_ticker.items():
+            trades.extend(_run_backtest_for_ticker(ticker, df, candidate, zone))
+
+        sorted_trades = sorted(trades, key=lambda trade: trade.entry_time)
+        summary, _, _ = _summarize_backtest(
+            sorted_trades,
+            candidate.starting_balance,
+            candidate.risk_per_trade,
+        )
+
+        if request.sort_by == "profit_factor":
+            score = summary.profit_factor or 0.0
+        elif request.sort_by == "score":
+            score = summary.return_pct - (summary.max_drawdown * 100.0)
+        else:
+            score = summary.return_pct
+
+        results.append(
+            GridSearchResult(
+                params={
+                    "sweep_atr_mult": sweep_mult,
+                    "return_within_bars": return_bars,
+                    "fvg_min_atr_mult": fvg_min,
+                    "fvg_retrace_window": fvg_retrace,
+                    "stop_atr_mult": stop_mult,
+                    "target_rr": target_rr,
+                },
+                summary=summary,
+                score=score,
+            )
+        )
+        total_tested += 1
+
+    results = sorted(results, key=lambda item: item.score, reverse=True)[: request.top_n]
+
+    meta = {
+        "tickers": tickers,
+        "interval": request.base.interval,
+        "session": request.base.session,
+        "timezone": SWEEP_TIMEZONE,
+        "combinations_tested": total_tested,
+        "max_combinations": request.max_combinations,
+        "sort_by": request.sort_by,
+        "data_ranges": data_ranges,
+        "notes": "Grid search uses cached data from the base request window.",
+    }
+    return GridSearchResponse(meta=meta, results=results)
+
+
+@app.post("/backtest/sweep/batch", response_model=BacktestBatchResponse)
+def backtest_sweep_batch(request: BacktestBatchRequest) -> BacktestBatchResponse:
+    zone = _get_sweep_zone()
+    _validate_backtest_request(request.base)
+
+    _BATCH_CONTROL["cancel"] = False
+
+    start_date = _parse_date_only(request.base.start)
+    end_date = _parse_date_only(request.base.end)
+    segments = _build_year_segments(start_date, end_date, request.start_year, request.end_year)
+
+    _BATCH_PROGRESS.update(
+        {
+            "status": "running",
+            "processed": 0,
+            "total": len(segments),
+            "current_year": segments[0][0] if segments else None,
+            "updated_at": time.time(),
+        }
+    )
+
+    results: List[BacktestYearResult] = []
+    tickers: List[str] = []
+    interval = request.base.interval
+    session = request.base.session
+
+    for year, seg_start, seg_end in segments:
+        if _BATCH_CONTROL["cancel"]:
+            break
+        _BATCH_PROGRESS.update(
+            {
+                "status": "running",
+                "processed": _BATCH_PROGRESS.get("processed", 0),
+                "total": len(segments),
+                "current_year": year,
+                "updated_at": time.time(),
+            }
+        )
+        segment_request = request.base.model_copy(
+            update={"start": seg_start.isoformat(), "end": seg_end.isoformat()}
+        )
+        tickers, data_by_ticker, data_ranges = _prepare_backtest_data(segment_request, zone)
+        trades: List[BacktestTrade] = []
+        for ticker, df in data_by_ticker.items():
+            trades.extend(_run_backtest_for_ticker(ticker, df, segment_request, zone))
+
+        sorted_trades = sorted(trades, key=lambda trade: trade.entry_time)
+        summary, _, _ = _summarize_backtest(
+            sorted_trades,
+            segment_request.starting_balance,
+            segment_request.risk_per_trade,
+        )
+
+        results.append(
+            BacktestYearResult(
+                year=year,
+                summary=summary,
+                total_trades=len(sorted_trades),
+                data_ranges=data_ranges,
+            )
+        )
+        _BATCH_PROGRESS.update(
+            {
+                "status": "running",
+                "processed": _BATCH_PROGRESS.get("processed", 0) + 1,
+                "total": len(segments),
+                "current_year": year,
+                "updated_at": time.time(),
+            }
+        )
+
+    meta = {
+        "tickers": tickers,
+        "interval": interval,
+        "session": session,
+        "timezone": SWEEP_TIMEZONE,
+        "start_year": segments[0][0],
+        "end_year": segments[-1][0],
+        "notes": "Batch backtest runs each year independently to keep downloads manageable.",
+    }
+    _BATCH_PROGRESS.update(
+        {
+            "status": "done" if not _BATCH_CONTROL["cancel"] else "idle",
+            "processed": _BATCH_PROGRESS.get("processed", 0),
+            "total": len(segments),
+            "current_year": segments[-1][0] if segments else None,
+            "updated_at": time.time(),
+        }
+    )
+    return BacktestBatchResponse(meta=meta, results=results)
+
+
+@app.get("/dukascopy/progress", response_model=DukascopyProgressResponse)
+def dukascopy_progress() -> DukascopyProgressResponse:
+    sources: List[dict] = []
+    for key, stats in _DUKASCOPY_PROGRESS.items():
+        processed = stats.get("processed", 0.0)
+        total = stats.get("total", 0.0)
+        percent = (processed / total * 100.0) if total else 0.0
+        sources.append(
+            {
+                "source": key,
+                "processed": processed,
+                "total": total,
+                "cached": stats.get("cached", 0.0),
+                "downloaded": stats.get("downloaded", 0.0),
+                "missing": stats.get("missing", 0.0),
+                "retry_attempts": stats.get("retry_attempts", 0.0),
+                "skipped": stats.get("skipped", 0.0),
+                "speed": stats.get("speed", 0.0),
+                "eta_seconds": stats.get("eta_seconds", 0.0),
+                "percent": percent,
+                "updated_at": stats.get("updated_at", 0.0),
+            }
+        )
+    sources.sort(key=lambda entry: entry["source"])
+    return DukascopyProgressResponse(
+        paused=_DUKASCOPY_CONTROL["pause"],
+        canceled=_DUKASCOPY_CONTROL["cancel"],
+        sources=sources,
+    )
+
+
+@app.post("/dukascopy/pause", response_model=DukascopyControlResponse)
+def dukascopy_pause() -> DukascopyControlResponse:
+    _DUKASCOPY_CONTROL["pause"] = True
+    _DUKASCOPY_CONTROL["cancel"] = False
+    return DukascopyControlResponse(paused=True, canceled=False)
+
+
+@app.post("/dukascopy/resume", response_model=DukascopyControlResponse)
+def dukascopy_resume() -> DukascopyControlResponse:
+    _DUKASCOPY_CONTROL["pause"] = False
+    _DUKASCOPY_CONTROL["cancel"] = False
+    return DukascopyControlResponse(paused=False, canceled=False)
+
+
+@app.post("/dukascopy/cancel", response_model=DukascopyControlResponse)
+def dukascopy_cancel() -> DukascopyControlResponse:
+    _DUKASCOPY_CONTROL["cancel"] = True
+    _DUKASCOPY_CONTROL["pause"] = False
+    return DukascopyControlResponse(
+        paused=_DUKASCOPY_CONTROL["pause"],
+        canceled=_DUKASCOPY_CONTROL["cancel"],
+    )
+
+
+@app.get("/backtest/sweep/batch/progress", response_model=BatchProgressResponse)
+def backtest_batch_progress() -> BatchProgressResponse:
+    return BatchProgressResponse(
+        status=str(_BATCH_PROGRESS.get("status", "idle")),
+        processed=int(_BATCH_PROGRESS.get("processed", 0)),
+        total=int(_BATCH_PROGRESS.get("total", 0)),
+        current_year=_BATCH_PROGRESS.get("current_year"),
+        updated_at=float(_BATCH_PROGRESS.get("updated_at", 0.0)),
+    )
+
+
+@app.post("/backtest/sweep/batch/cancel")
+def backtest_batch_cancel() -> dict:
+    _BATCH_CONTROL["cancel"] = True
+    _BATCH_PROGRESS.update(
+        {
+            "status": "idle",
+            "updated_at": time.time(),
+        }
+    )
+    return {"canceled": True}
 
 
 async def _sweep_monitor_loop() -> None:

@@ -46,6 +46,8 @@ npm run dev:all
 ### Environment
 - Copy `frontend/.env.example` to `frontend/.env` and update `VITE_API_BASE` if needed.
 - (Optional) Copy `backend/.env.example` to `backend/.env` to enable sweep SMS alerts and background monitoring.
+- To use Dukascopy for deeper backtests, set `BACKTEST_DATA_SOURCE=dukascopy` in `backend/.env`.
+- Dukascopy tuning options: `DUKASCOPY_SKIP_WEEKENDS`, `DUKASCOPY_MAX_WORKERS`, and `DUKASCOPY_BATCH_HOURS` can speed up large backfills.
 
 ## API
 - `GET /analyze/{ticker}/{interval}` returns `meta`, `candles[]`, `signals[]`, and `indicators[]`.
